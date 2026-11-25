@@ -39,11 +39,13 @@ rm -rf "$WORK/php-src/ext/php_debugger/.git"
 mkdir -p "$WORK/php-src/m4"
 cp "$EXT_SRC"/m4/*.m4 "$WORK/php-src/m4/"
 
-# Links against the container's glibc instead of musl
-export SPC_TARGET=native-native-gnu
+# Link against glibc instead of musl, targeting the oldest version supported.
+# With a target set, StaticPHP builds with its zig toolchain.
+export SPC_TARGET="native-native-gnu.${MAX_GLIBC}"
 
 spc doctor --auto-fix
-spc download --for-extensions="$EXTENSIONS" --custom-local="php-src:$WORK/php-src"
+# Registers the PHP source; the build downloads the libraries and toolchain it needs
+spc download php-src --custom-local="php-src:$WORK/php-src"
 
 # StaticPHP's default configure command (config/env.ini, [linux]) plus the
 # debugger and the mhash functions, which StaticPHP has no option for. PHP 8.6 bundles Libtool 2.5, which rejects --with-pic in favour of
@@ -55,7 +57,7 @@ esac
 ZTS_ARG=""
 [ "$TS" = "ts" ] && ZTS_ARG="--enable-zts"
 SPC_CMD_PREFIX_PHP_CONFIGURE="./configure --prefix= --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-rtld-now --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger" \
-    spc build:php-cli "$EXTENSIONS" --no-download $ZTS_ARG \
+    spc build:php-cli "$EXTENSIONS" $ZTS_ARG \
         --disable-opcache-jit \
         --with-config-file-path=/usr/local/etc/php \
         --with-config-file-scan-dir=/usr/local/etc/php/conf.d
