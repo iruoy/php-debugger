@@ -176,32 +176,20 @@ jobs:
                     php -n run-xdebug-tests.php -q tests/debugger/bug00530.phpt
 
             -   name: Package artifact
-                id: package
                 run: |
-                    PHP_VER=$(php -r "echo PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;")
-                    OS_TAG="macos"
-                    ARCH_TAG="arm64"
-                    TS_TAG="${{ matrix.ts }}"
-                    ASSET_NAME="php-debugger-php${PHP_VER}-${TS_TAG}-${OS_TAG}-${ARCH_TAG}.so"
-                    cp modules/php_debugger.so "${ASSET_NAME}"
-
-                    # PIE pre-packaged-binary asset: an exactly named zip with
-                    # php_debugger.so at its root (see "download-url-method" in
-                    # composer.json). PIE reports macOS libc as bsdlibc.
-                    PIE_TS=$([ "$TS_TAG" = ts ] && echo zts || echo nts)
-                    PIE_ZIP="php_php_debugger-${RELEASE_REF}_php${PHP_VER}-${ARCH_TAG}-darwin-bsdlibc-${PIE_TS}.zip"
-                    zip -j "${PIE_ZIP}" modules/php_debugger.so
-
-                    echo "asset_name=${ASSET_NAME}" >> $GITHUB_OUTPUT
-                    echo "pie_zip=${PIE_ZIP}" >> $GITHUB_OUTPUT
+                    PHP_VER="${{ matrix.php-version }}"
+                    mkdir dist
+                    cp modules/php_debugger.so "dist/php-debugger-php${PHP_VER}-${{ matrix.ts }}-macos-arm64.so"
+                    # PIE asset: an exactly named zip with php_debugger.so at its root
+                    # (see "download-url-method" in composer.json); PIE calls the macOS
+                    # libc bsdlibc
+                    zip -j "dist/php_php_debugger-${RELEASE_REF}_php${PHP_VER}-arm64-darwin-bsdlibc-${{ matrix.ts == 'ts' && 'zts' || 'nts' }}.zip" modules/php_debugger.so
 
             -   name: Upload artifact
                 uses: actions/upload-artifact@v6
                 with:
-                    name: ${{ steps.package.outputs.asset_name }}
-                    path: |
-                        ${{ steps.package.outputs.asset_name }}
-                        ${{ steps.package.outputs.pie_zip }}
+                    name: release--macos-${{ matrix.php-version }}-${{ matrix.ts }}
+                    path: dist/
 
     build-linux:
         needs: [validate-tag, resolve-php-versions]
@@ -232,13 +220,8 @@ jobs:
                 with:
                     ref: ${{ env.RELEASE_REF }}
 
-            # Built in a container rather than against the runner's PHP, so the
-            # binaries need only an older libc: glibc 2.34 (AlmaLinux 9) or musl
-            # 1.2.5 (Alpine 3.23), where a build on a GitHub Ubuntu runner needs
-            # that runner's glibc (2.38 for 0.6.2). The images are in
-            # .github/builders/; the build script
-            # also checks the glibc version, that the binary loads, and runs a
-            # DBGp smoke test.
+            # Built in the images in .github/builders/ rather than on the runner,
+            # to pin the oldest libc the binaries need; see the Dockerfiles
             -   name: Build and test extension
                 run: |
                     case "${{ matrix.php-version }}" in
@@ -256,36 +239,25 @@ jobs:
                       sh /ext/.github/scripts/build-linux-binary.sh "$PHP_TAG" "${{ matrix.ts }}" /ext /out
 
             -   name: Package artifact
-                id: package
                 run: |
                     PHP_VER="${{ matrix.php-version }}"
                     ARCH_TAG="${{ matrix.arch.arch }}"
-                    TS_TAG="${{ matrix.ts }}"
                     LIBC="${{ matrix.libc }}"
                     mkdir dist
-
-                    # PIE pre-packaged-binary asset: an exactly named zip with
-                    # php_debugger.so at its root (see "download-url-method" in
-                    # composer.json)
-                    PIE_TS=$([ "$TS_TAG" = ts ] && echo zts || echo nts)
-                    PIE_ZIP="php_php_debugger-${RELEASE_REF}_php${PHP_VER}-${ARCH_TAG}-linux-${LIBC}-${PIE_TS}.zip"
-                    zip -j "dist/${PIE_ZIP}" "$RUNNER_TEMP/out/php_debugger.so"
-
-                    # The plain .so asset is for glibc only. The installer
-                    # (php-debugger/installer) matches assets on the tokens in
-                    # their names and has no notion of libc, so a musl .so named
-                    # like this would be indistinguishable from the glibc one and
-                    # could be picked on a glibc system.
+                    # PIE asset: an exactly named zip with php_debugger.so at its root
+                    # (see "download-url-method" in composer.json)
+                    zip -j "dist/php_php_debugger-${RELEASE_REF}_php${PHP_VER}-${ARCH_TAG}-linux-${LIBC}-${{ matrix.ts == 'ts' && 'zts' || 'nts' }}.zip" "$RUNNER_TEMP/out/php_debugger.so"
+                    # The plain .so is for glibc only: php-debugger/installer matches
+                    # assets on the tokens in their names and cannot tell libcs apart,
+                    # so it could pick a musl .so on a glibc system
                     if [ "$LIBC" = glibc ]; then
-                        cp "$RUNNER_TEMP/out/php_debugger.so" "dist/php-debugger-php${PHP_VER}-${TS_TAG}-linux-${ARCH_TAG}.so"
+                        cp "$RUNNER_TEMP/out/php_debugger.so" "dist/php-debugger-php${PHP_VER}-${{ matrix.ts }}-linux-${ARCH_TAG}.so"
                     fi
-
-                    echo "artifact_name=${PIE_ZIP%.zip}" >> $GITHUB_OUTPUT
 
             -   name: Upload artifact
                 uses: actions/upload-artifact@v6
                 with:
-                    name: ${{ steps.package.outputs.artifact_name }}
+                    name: release--linux-${{ matrix.php-version }}-${{ matrix.ts }}-${{ matrix.arch.arch }}-${{ matrix.libc }}
                     path: dist/
 
     build-windows:
@@ -318,73 +290,34 @@ jobs:
                     ts: ${{ matrix.ts }}
                     args: --enable-php-debugger
                     run-tests: false
+                    # Version in the builder's zip name; it defaults to the ref
+                    # name, which on a workflow_dispatch run is the branch
+                    extension-ref: ${{ env.RELEASE_REF }}
 
             -   name: Package artifact
-                id: package
                 shell: pwsh
                 run: |
-                    $phpVer = "${{ matrix.php-version }}"
-                    $tsTag = "${{ matrix.ts }}"
-                    $assetName = "php_php-debugger-php${phpVer}-${tsTag}-windows-x64.dll"
+                    # The builder leaves its package in artifacts\ (and a log zip of the
+                    # same name in artifacts\logs\), already named and laid out the way
+                    # PIE expects: php_{ext}-{version}-{php}-{ts}-{compiler}-{arch}.zip
+                    # with a DLL of the same base name. It is the PIE asset as is.
+                    $found = @(Get-Item "artifacts\php_php_debugger-$($env:RELEASE_REF)-${{ matrix.php-version }}-${{ matrix.ts }}-*-x86_64.zip")
+                    if ($found.Count -ne 1) { Write-Error "Expected one builder zip in artifacts\, found $($found.Count)"; exit 1 }
+                    $pieZip = $found[0]
+                    New-Item -ItemType Directory -Force -Path dist | Out-Null
+                    Copy-Item $pieZip.FullName -Destination dist\
 
-                    # Find the outer zip file
-                    $outerZip = Get-ChildItem -Path $env:RUNNER_TEMP -Recurse -Filter 'php_php_debugger*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
-                    if (-not $outerZip) {
-                        $outerZip = Get-ChildItem -Recurse -Filter 'php_php_debugger*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
-                    }
-                    if (-not $outerZip) { Write-Error "php_php_debugger zip not found"; exit 1 }
-                    Write-Host "Found outer zip at: $($outerZip.FullName)"
-
-                    # Extract outer zip
-                    $tempDir = Join-Path $env:TEMP "extract_outer"
-                    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
-                    Expand-Archive -Path $outerZip.FullName -DestinationPath $tempDir -Force
-
-                    # Find inner zip
-                    $innerZip = Get-ChildItem -Path $tempDir -Recurse -Filter '*.zip' | Select-Object -First 1
-                    if ($innerZip) {
-                        Write-Host "Found inner zip at: $($innerZip.FullName)"
-                        $tempDir2 = Join-Path $env:TEMP "extract_inner"
-                        New-Item -ItemType Directory -Force -Path $tempDir2 | Out-Null
-                        Expand-Archive -Path $innerZip.FullName -DestinationPath $tempDir2 -Force
-                        $dll = Get-ChildItem -Path $tempDir2 -Filter '*.dll' | Select-Object -First 1
-                    } else {
-                        # DLL might be directly in outer zip
-                        $dll = Get-ChildItem -Path $tempDir -Recurse -Filter '*.dll' | Select-Object -First 1
-                    }
-
-                    if (-not $dll) { Write-Error "DLL not found in zip"; exit 1 }
-                    Write-Host "Found DLL at: $($dll.FullName)"
-                    Copy-Item $dll.FullName -Destination $assetName
-
-                    # PIE asset: php_{ext}-{version}-{php}-{ts}-{compiler}-{arch}.zip
-                    # holding a DLL of the same base name. PIE only installs
-                    # binaries on Windows (it never builds there), so this name has
-                    # to match exactly. The compiler (vs16/vs17/vs18) is taken from
-                    # the builder's own zip name rather than hardcoded per PHP version.
-                    $zipNames = @($outerZip.Name)
-                    if ($innerZip) { $zipNames += $innerZip.Name }
-                    $compiler = $null
-                    foreach ($n in $zipNames) {
-                        if ($n -match '-(vs\d+|vc\d+)-') { $compiler = $Matches[1].ToLower(); break }
-                    }
-                    if (-not $compiler) { Write-Error "Compiler not found in zip names: $($zipNames -join ', ')"; exit 1 }
-                    $pieBase = "php_php_debugger-$($env:RELEASE_REF)-${phpVer}-${tsTag}-${compiler}-x86_64"
-                    $pieDir = Join-Path $env:RUNNER_TEMP "pie"
-                    New-Item -ItemType Directory -Force -Path $pieDir | Out-Null
-                    Copy-Item $dll.FullName -Destination (Join-Path $pieDir "${pieBase}.dll")
-                    Compress-Archive -Path (Join-Path $pieDir "${pieBase}.dll") -DestinationPath "${pieBase}.zip"
-
-                    Add-Content -Path $env:GITHUB_OUTPUT -Value "asset_name=${assetName}" -Encoding utf8
-                    Add-Content -Path $env:GITHUB_OUTPUT -Value "pie_zip=${pieBase}.zip" -Encoding utf8
+                    $extracted = Join-Path $env:RUNNER_TEMP "extension"
+                    Expand-Archive -Path $pieZip.FullName -DestinationPath $extracted -Force
+                    $dll = Get-ChildItem -Path $extracted -Filter '*.dll' | Select-Object -First 1
+                    if (-not $dll) { Write-Error "DLL not found in $($pieZip.Name)"; exit 1 }
+                    Copy-Item $dll.FullName -Destination "dist\php_php-debugger-php${{ matrix.php-version }}-${{ matrix.ts }}-windows-x64.dll"
 
             -   name: Upload artifact
                 uses: actions/upload-artifact@v6
                 with:
-                    name: ${{ steps.package.outputs.asset_name }}
-                    path: |
-                        ${{ steps.package.outputs.asset_name }}
-                        ${{ steps.package.outputs.pie_zip }}
+                    name: release--windows-${{ matrix.php-version }}-${{ matrix.ts }}
+                    path: dist/
 
     build-php-macos:
         needs: [validate-tag, resolve-php-versions]
@@ -525,7 +458,7 @@ jobs:
             -   name: Upload artifact
                 uses: actions/upload-artifact@v6
                 with:
-                    name: ${{ steps.package.outputs.asset_name }}
+                    name: release--${{ steps.package.outputs.asset_name }}
                     path: ${{ steps.package.outputs.asset_path }}
 
     build-php-linux:
@@ -647,7 +580,7 @@ jobs:
             -   name: Upload artifact
                 uses: actions/upload-artifact@v6
                 with:
-                    name: ${{ steps.package.outputs.asset_name }}
+                    name: release--${{ steps.package.outputs.asset_name }}
                     path: ${{ steps.package.outputs.asset_path }}
 
     # Lives in its own reusable workflow so pull requests that change it are
@@ -676,35 +609,18 @@ jobs:
                 with:
                     ref: ${{ env.RELEASE_REF }}
 
-            -   name: Download all artifacts
+            # Every build job uploads exactly the files it publishes, in an
+            # artifact named release--*. Other artifacts in the run, such as
+            # php-windows-builder's own uploads, are left out.
+            -   name: Download release assets
                 uses: actions/download-artifact@v6
                 with:
-                    path: artifacts
+                    pattern: release--*
+                    merge-multiple: true
+                    path: release-assets
 
-            -   name: Collect release assets
-                run: |
-                    mkdir release-assets
-                    {
-                        # Extension files (.so and .dll)
-                        find artifacts -type f \( -name '*.so' -o -name '*.dll' \)
-                        # PIE pre-packaged binaries (zips with the .so/.dll inside).
-                        # php-windows-builder uploads artifacts of its own, named
-                        # php_php_debugger-*.zip, that hold its build zip and a log
-                        # zip under the same file names as ours: skip those.
-                        find artifacts -type f -name 'php_php_debugger-*.zip' ! -path 'artifacts/php_php_debugger-*.zip/*'
-                        # PHP interpreters: a bare binary for Unix, a zip bundle for
-                        # Windows (php.exe needs php8.dll and the dependency DLLs beside it)
-                        find artifacts -type f -name 'php-php*' \( ! -name '*.zip' -o -name '*-windows-*.zip' \)
-                    } > release-files.txt
-                    # Files from different artifacts can share a name; copying them
-                    # into one directory would silently keep only the last one
-                    DUPLICATES=$(xargs -n1 basename < release-files.txt | sort | uniq -d)
-                    if [ -n "$DUPLICATES" ]; then
-                        echo "::error::Several artifacts contain a file with the same name: ${DUPLICATES}"
-                        exit 1
-                    fi
-                    xargs -I{} cp {} release-assets/ < release-files.txt
-                    ls -la release-assets/
+            -   name: List release assets
+                run: ls -la release-assets/
 
             -   name: Create release
                 uses: softprops/action-gh-release@v3

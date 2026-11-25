@@ -3,12 +3,8 @@
 # Linux release assets (the plain .so downloads and the PIE
 # pre-packaged-binary zips).
 #
-# Runs inside one of the build images in .github/builders/: glibc (AlmaLinux
-# 9) or musl (Alpine). The image decides the oldest libc the binary runs on;
-# see the comments there. This matters because a binary built on a GitHub
-# Ubuntu runner needs the glibc of that runner (2.38 for the 0.6.2 release
-# binaries) and will not load on Debian 12 or Ubuntu 22.04, something PIE
-# cannot detect before installing it.
+# Runs inside one of the build images in .github/builders/, which decide the
+# oldest libc the binary runs on; see the comments there.
 #
 # PHP is built from source with everything disabled, only to get the headers,
 # phpize and php-config for exactly this version and thread-safety mode, plus
@@ -60,10 +56,10 @@ if [ -n "${MAX_GLIBC:-}" ]; then
 fi
 
 /opt/php/bin/php -n -d zend_extension="$EXT" -v
-TS="$TS" /opt/php/bin/php -n -d zend_extension="$EXT" -r '
+/opt/php/bin/php -n -d zend_extension="$EXT" -r '
     if (!function_exists("xdebug_info") || !function_exists("php_debugger_info")) { fwrite(STDERR, "functions missing\n"); exit(1); }
-    if ((bool) PHP_ZTS !== (getenv("TS") === "ts")) { fwrite(STDERR, "thread safety mismatch\n"); exit(1); }
-'
+    if ((bool) PHP_ZTS !== ($argv[1] === "ts")) { fwrite(STDERR, "thread safety mismatch\n"); exit(1); }
+' "$TS"
 
 # DBGp smoke test: a debug client actually attaches and drives a script
 TEST_PHP_EXECUTABLE=/opt/php/bin/php TEST_PHP_ARGS="-n -d zend_extension=$EXT" \

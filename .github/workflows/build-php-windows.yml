@@ -253,5 +253,6 @@ jobs:
             -   name: Upload artifact
                 uses: actions/upload-artifact@v6
                 with:
-                    name: ${{ steps.package.outputs.asset_name }}
+                    # release.yml publishes artifacts named release--*
+                    name: release--${{ steps.package.outputs.asset_name }}
                     path: ${{ steps.package.outputs.asset_name }}

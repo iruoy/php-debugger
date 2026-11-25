@@ -6,10 +6,8 @@ updates:
     schedule:
       interval: "monthly"
 
-  # Digest pins of the Linux release build images. Moving to a newer base
-  # (AlmaLinux 10, Alpine 3.24) raises the oldest glibc/musl the release
-  # binaries run on, so only digest updates are allowed; see the comments in
-  # the Dockerfiles.
+  # Linux release build images: digest updates only, since a newer base
+  # version raises the oldest libc the binaries run on (see the Dockerfiles)
   - package-ecosystem: "docker"
     directories:
       - "/.github/builders/glibc"
