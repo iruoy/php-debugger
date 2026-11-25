@@ -91,41 +91,26 @@ jobs:
                         exit 1
                     fi
 
+    # The PHP source every job builds against, resolved once so all platforms
+    # in a release use the same PHP patch versions: the latest php.net release
+    # tarball of each version, or its current pre-release before the first
+    # stable release. Jobs read their entry with
+    # fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].
     resolve-php-versions:
         runs-on: ubuntu-latest
         outputs:
-            php-8-2-tag: ${{ steps.resolve.outputs.php-8-2-tag }}
-            php-8-3-tag: ${{ steps.resolve.outputs.php-8-3-tag }}
-            php-8-4-tag: ${{ steps.resolve.outputs.php-8-4-tag }}
-            php-8-5-tag: ${{ steps.resolve.outputs.php-8-5-tag }}
-            php-8-6-tag: ${{ steps.resolve.outputs.php-8-6-tag }}
+            php-sources: ${{ steps.resolve.outputs.php-sources }}
         steps:
-            -   name: Resolve PHP version tags
+            -   uses: actions/checkout@v7
+                with:
+                    ref: ${{ env.RELEASE_REF }}
+                    sparse-checkout: .github/scripts
+
+            -   name: Resolve PHP sources
                 id: resolve
                 run: |
-                    for version in 8.2 8.3 8.4 8.5 8.6; do
-                        # Get all tags for the version and find the latest stable release.
-                        # build-php-windows.yml repeats this for pull request runs; keep the
-                        # two in sync.
-                        PHP_TAG=$(git ls-remote --tags https://github.com/php/php-src.git | \
-                          grep "refs/tags/php-${version}\." | \
-                          grep -v '\^{}' | \
-                          grep -vE 'RC|alpha|beta' | \
-                          sed 's/.*refs\/tags\///' | \
-                          sort -V | \
-                          tail -1)
-
-                        if [ -z "$PHP_TAG" ]; then
-                            echo "No stable tag found for PHP ${version}, using branch PHP-${version}"
-                            PHP_TAG="PHP-${version}"
-                        else
-                            echo "Using latest stable tag for PHP ${version}: ${PHP_TAG}"
-                        fi
-
-                        # Set output with underscores instead of dots for output names
-                        output_name="php-$(echo $version | tr '.' '-')-tag"
-                        echo "${output_name}=${PHP_TAG}" >> $GITHUB_OUTPUT
-                    done
+                    SOURCES=$(python3 .github/scripts/resolve-php-sources.py 8.2 8.3 8.4 8.5 8.6)
+                    echo "php-sources=${SOURCES}" >> "$GITHUB_OUTPUT"
 
     build-macos:
         needs: validate-tag
@@ -223,20 +208,16 @@ jobs:
             # Built in the images in .github/builders/ rather than on the runner,
             # to pin the oldest libc the binaries need; see the Dockerfiles
             -   name: Build and test extension
+                env:
+                    PHP_URL: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].url }}
+                    PHP_SHA256: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].sha256 }}
                 run: |
-                    case "${{ matrix.php-version }}" in
-                        8.2) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-2-tag }}" ;;
-                        8.3) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-3-tag }}" ;;
-                        8.4) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-4-tag }}" ;;
-                        8.5) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-5-tag }}" ;;
-                        8.6) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-6-tag }}" ;;
-                    esac
                     docker build -q -t php-debugger-builder ".github/builders/${{ matrix.libc }}"
                     docker run --rm \
                       -v "$PWD:/ext:ro" \
                       -v "$RUNNER_TEMP/out:/out" \
                       php-debugger-builder \
-                      sh /ext/.github/scripts/build-linux-binary.sh "$PHP_TAG" "${{ matrix.ts }}" /ext /out
+                      sh /ext/.github/scripts/build-linux-binary.sh "$PHP_URL" "$PHP_SHA256" "${{ matrix.ts }}" /ext /out
 
             -   name: Package artifact
                 run: |
@@ -344,23 +325,14 @@ jobs:
 
             -   name: Install build dependencies
                 run: |
-                    brew install autoconf automake libtool bison re2c pkg-config \
+                    brew install autoconf automake libtool pkg-config \
                       openssl@3 argon2 oniguruma libsodium
 
-            -   name: Clone PHP source
-                run: |
-                    # Use the pre-resolved PHP tag from the resolve-php-versions job
-                    case "${{ matrix.php-version }}" in
-                        8.2) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-2-tag }}" ;;
-                        8.3) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-3-tag }}" ;;
-                        8.4) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-4-tag }}" ;;
-                        8.5) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-5-tag }}" ;;
-                        8.6) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-6-tag }}" ;;
-                    esac
-
-                    echo "Using resolved PHP tag: ${PHP_TAG}"
-                    git clone --depth=1 --branch="${PHP_TAG}" \
-                      https://github.com/php/php-src.git ~/php-src
+            -   name: Fetch PHP source
+                env:
+                    PHP_URL: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].url }}
+                    PHP_SHA256: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].sha256 }}
+                run: sh ext-src/.github/scripts/fetch-php-source.sh "$PHP_URL" "$PHP_SHA256" ~/php-src
 
             -   name: Copy extension into php-src
                 run: |
@@ -376,11 +348,11 @@ jobs:
                     SDK_PATH=$(xcrun --show-sdk-path)
                     ICONV_PATH="${SDK_PATH}/usr"
 
-                    # Extract the actual PHP version from the cloned source (from main/php_version.h)
+                    # Extract the actual PHP version from the source (from main/php_version.h)
                     PHP_FULL_VERSION=$(grep 'PHP_VERSION ' main/php_version.h | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
                     PHP_MINOR_VERSION="${{ matrix.php-version }}"
 
-                    export PATH="/opt/homebrew/opt/bison/bin:/opt/homebrew/bin:$PATH"
+                    export PATH="/opt/homebrew/bin:$PATH"
 
                     PREFIX="/opt/homebrew/Cellar/php@${PHP_MINOR_VERSION}/${PHP_FULL_VERSION}"
                     LOCALSTATEDIR="/opt/homebrew/var"
@@ -492,24 +464,15 @@ jobs:
             -   name: Install build dependencies
                 run: |
                     sudo apt-get update
-                    sudo apt-get install -y autoconf automake libtool bison re2c pkg-config \
+                    sudo apt-get install -y autoconf automake libtool pkg-config \
                       libxml2-dev libsqlite3-dev libcurl4-openssl-dev libssl-dev libreadline-dev \
                       libsodium-dev libargon2-dev libonig-dev build-essential
 
-            -   name: Clone PHP source
-                run: |
-                    # Use the pre-resolved PHP tag from the resolve-php-versions job
-                    case "${{ matrix.php-version }}" in
-                        8.2) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-2-tag }}" ;;
-                        8.3) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-3-tag }}" ;;
-                        8.4) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-4-tag }}" ;;
-                        8.5) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-5-tag }}" ;;
-                        8.6) PHP_TAG="${{ needs.resolve-php-versions.outputs.php-8-6-tag }}" ;;
-                    esac
-
-                    echo "Using resolved PHP tag: ${PHP_TAG}"
-                    git clone --depth=1 --branch="${PHP_TAG}" \
-                      https://github.com/php/php-src.git ~/php-src
+            -   name: Fetch PHP source
+                env:
+                    PHP_URL: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].url }}
+                    PHP_SHA256: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].sha256 }}
+                run: sh ext-src/.github/scripts/fetch-php-source.sh "$PHP_URL" "$PHP_SHA256" ~/php-src
 
             -   name: Copy extension into php-src
                 run: |
@@ -592,11 +555,7 @@ jobs:
             # Same value as env.RELEASE_REF, which is not available in with: when
             # calling a reusable workflow, so the expression is repeated here.
             ref: ${{ github.event.inputs.tag || github.ref_name }}
-            php-8-2-tag: ${{ needs.resolve-php-versions.outputs.php-8-2-tag }}
-            php-8-3-tag: ${{ needs.resolve-php-versions.outputs.php-8-3-tag }}
-            php-8-4-tag: ${{ needs.resolve-php-versions.outputs.php-8-4-tag }}
-            php-8-5-tag: ${{ needs.resolve-php-versions.outputs.php-8-5-tag }}
-            php-8-6-tag: ${{ needs.resolve-php-versions.outputs.php-8-6-tag }}
+            php-sources: ${{ needs.resolve-php-versions.outputs.php-sources }}
 
     release:
         needs: [build-macos, build-linux, build-windows, build-php-macos, build-php-linux, build-php-windows]

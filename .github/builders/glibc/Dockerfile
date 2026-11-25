@@ -12,7 +12,6 @@ FROM almalinux:9@sha256:02df05719ef287ebd0df0a1eedb9172a00bd70703aed7b25660e426b
 # The build fails if the binary needs a newer glibc than this
 ENV MAX_GLIBC=2.34
 
-# re2c is only packaged in EPEL
-RUN dnf install -y -q epel-release \
-    && dnf install -y -q gcc make bison re2c autoconf automake libtool git file diffutils findutils \
+# PHP is built from a release tarball, which needs no bison or re2c
+RUN dnf install -y -q gcc make autoconf automake libtool file diffutils findutils xz \
     && dnf clean all

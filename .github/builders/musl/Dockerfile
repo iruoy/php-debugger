@@ -10,4 +10,5 @@
 # bumps the digest.
 FROM alpine:3.23@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2
 
-RUN apk add --no-cache build-base linux-headers autoconf automake libtool bison re2c git file
+# PHP is built from a release tarball, which needs no bison or re2c
+RUN apk add --no-cache build-base linux-headers autoconf automake libtool file curl xz tar

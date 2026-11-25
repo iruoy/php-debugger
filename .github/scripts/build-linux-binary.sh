@@ -13,17 +13,18 @@
 # If MAX_GLIBC is set (the glibc image sets it), the build fails when the
 # binary needs a newer glibc than that.
 #
-# Usage: build-linux-binary.sh <php-src tag or branch> <nts|ts> <extension source dir> <output dir>
+# Usage: build-linux-binary.sh <php tarball url> <sha256> <nts|ts> <extension source dir> <output dir>
+# (the tarball as resolved by resolve-php-sources.py)
 set -eu
 
-PHP_TAG="$1"
-TS="$2"
-EXT_SRC="$3"
-OUT_DIR="$4"
+PHP_URL="$1"
+PHP_SHA256="$2"
+TS="$3"
+EXT_SRC="$4"
+OUT_DIR="$5"
 
-git clone --quiet --depth=1 --branch="${PHP_TAG}" https://github.com/php/php-src.git /tmp/php-src
+sh "$EXT_SRC/.github/scripts/fetch-php-source.sh" "$PHP_URL" "$PHP_SHA256" /tmp/php-src
 cd /tmp/php-src
-./buildconf --force >/dev/null
 ZTS_FLAG=""
 [ "$TS" = "ts" ] && ZTS_FLAG="--enable-zts"
 ./configure --quiet --prefix=/opt/php --disable-all --disable-cgi --disable-phpdbg $ZTS_FLAG
