@@ -234,8 +234,9 @@ jobs:
 
             # Built in a container rather than against the runner's PHP, so the
             # binaries need only an older libc: glibc 2.34 (AlmaLinux 9) or musl
-            # 1.2.5 (Alpine 3.23), where a build on the Ubuntu 24.04 runner needs
-            # glibc 2.38. The images are in .github/builders/; the build script
+            # 1.2.5 (Alpine 3.23), where a build on a GitHub Ubuntu runner needs
+            # that runner's glibc (2.38 for 0.6.2). The images are in
+            # .github/builders/; the build script
             # also checks the glibc version, that the binary loads, and runs a
             # DBGp smoke test.
             -   name: Build and test extension

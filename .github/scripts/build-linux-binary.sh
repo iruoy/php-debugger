@@ -5,9 +5,10 @@
 #
 # Runs inside one of the build images in .github/builders/: glibc (AlmaLinux
 # 9) or musl (Alpine). The image decides the oldest libc the binary runs on;
-# see the comments there. This matters because a binary built on the GitHub
-# runner itself (Ubuntu 24.04) needs glibc 2.38 and will not load on Debian
-# 12 or Ubuntu 22.04, something PIE cannot detect before installing it.
+# see the comments there. This matters because a binary built on a GitHub
+# Ubuntu runner needs the glibc of that runner (2.38 for the 0.6.2 release
+# binaries) and will not load on Debian 12 or Ubuntu 22.04, something PIE
+# cannot detect before installing it.
 #
 # PHP is built from source with everything disabled, only to get the headers,
 # phpize and php-config for exactly this version and thread-safety mode, plus
