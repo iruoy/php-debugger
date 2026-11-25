@@ -262,28 +262,31 @@ jobs:
                     ARCH_TAG="${{ matrix.arch.arch }}"
                     TS_TAG="${{ matrix.ts }}"
                     LIBC="${{ matrix.libc }}"
-                    # glibc keeps the existing asset name; musl is marked in it
-                    OS_TAG=$([ "$LIBC" = musl ] && echo linux-musl || echo linux)
-                    ASSET_NAME="php-debugger-php${PHP_VER}-${TS_TAG}-${OS_TAG}-${ARCH_TAG}.so"
-                    cp "$RUNNER_TEMP/out/php_debugger.so" "${ASSET_NAME}"
+                    mkdir dist
 
                     # PIE pre-packaged-binary asset: an exactly named zip with
                     # php_debugger.so at its root (see "download-url-method" in
                     # composer.json)
                     PIE_TS=$([ "$TS_TAG" = ts ] && echo zts || echo nts)
                     PIE_ZIP="php_php_debugger-${RELEASE_REF}_php${PHP_VER}-${ARCH_TAG}-linux-${LIBC}-${PIE_TS}.zip"
-                    zip -j "${PIE_ZIP}" "$RUNNER_TEMP/out/php_debugger.so"
+                    zip -j "dist/${PIE_ZIP}" "$RUNNER_TEMP/out/php_debugger.so"
 
-                    echo "asset_name=${ASSET_NAME}" >> $GITHUB_OUTPUT
-                    echo "pie_zip=${PIE_ZIP}" >> $GITHUB_OUTPUT
+                    # The plain .so asset is for glibc only. The installer
+                    # (php-debugger/installer) matches assets on the tokens in
+                    # their names and has no notion of libc, so a musl .so named
+                    # like this would be indistinguishable from the glibc one and
+                    # could be picked on a glibc system.
+                    if [ "$LIBC" = glibc ]; then
+                        cp "$RUNNER_TEMP/out/php_debugger.so" "dist/php-debugger-php${PHP_VER}-${TS_TAG}-linux-${ARCH_TAG}.so"
+                    fi
+
+                    echo "artifact_name=${PIE_ZIP%.zip}" >> $GITHUB_OUTPUT
 
             -   name: Upload artifact
                 uses: actions/upload-artifact@v6
                 with:
-                    name: ${{ steps.package.outputs.asset_name }}
-                    path: |
-                        ${{ steps.package.outputs.asset_name }}
-                        ${{ steps.package.outputs.pie_zip }}
+                    name: ${{ steps.package.outputs.artifact_name }}
+                    path: dist/
 
     build-windows:
         needs: validate-tag
