@@ -684,13 +684,26 @@ jobs:
             -   name: Collect release assets
                 run: |
                     mkdir release-assets
-                    # Copy extension files (.so and .dll)
-                    find artifacts -type f \( -name '*.so' -o -name '*.dll' \) -exec cp {} release-assets/ \;
-                    # PIE pre-packaged binaries (zips with the .so/.dll inside)
-                    find artifacts -type f -name 'php_php_debugger-*.zip' -exec cp {} release-assets/ \;
-                    # Copy PHP interpreters: a bare binary for Unix, a zip bundle for
-                    # Windows (php.exe needs php8.dll and the dependency DLLs beside it)
-                    find artifacts -type f -name 'php-php*' \( ! -name '*.zip' -o -name '*-windows-*.zip' \) -exec cp {} release-assets/ \;
+                    {
+                        # Extension files (.so and .dll)
+                        find artifacts -type f \( -name '*.so' -o -name '*.dll' \)
+                        # PIE pre-packaged binaries (zips with the .so/.dll inside).
+                        # php-windows-builder uploads artifacts of its own, named
+                        # php_php_debugger-*.zip, that hold its build zip and a log
+                        # zip under the same file names as ours: skip those.
+                        find artifacts -type f -name 'php_php_debugger-*.zip' ! -path 'artifacts/php_php_debugger-*.zip/*'
+                        # PHP interpreters: a bare binary for Unix, a zip bundle for
+                        # Windows (php.exe needs php8.dll and the dependency DLLs beside it)
+                        find artifacts -type f -name 'php-php*' \( ! -name '*.zip' -o -name '*-windows-*.zip' \)
+                    } > release-files.txt
+                    # Files from different artifacts can share a name; copying them
+                    # into one directory would silently keep only the last one
+                    DUPLICATES=$(xargs -n1 basename < release-files.txt | sort | uniq -d)
+                    if [ -n "$DUPLICATES" ]; then
+                        echo "::error::Several artifacts contain a file with the same name: ${DUPLICATES}"
+                        exit 1
+                    fi
+                    xargs -I{} cp {} release-assets/ < release-files.txt
                     ls -la release-assets/
 
             -   name: Create release
