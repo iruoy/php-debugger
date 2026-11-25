@@ -11,6 +11,7 @@ updates:
   - package-ecosystem: "docker"
     directories:
       - "/.github/builders/glibc"
+      - "/.github/builders/interpreter"
       - "/.github/builders/musl"
     schedule:
       interval: "monthly"

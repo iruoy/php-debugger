@@ -41,9 +41,10 @@ env:
     # in the UI, not the tag) still builds and releases the right commit.
     RELEASE_REF: ${{ github.event.inputs.tag || github.ref_name }}
 
-    # Common configure flags for all Unix builds (JIT disabled - incompatible with php-debugger).
-    # The PIC flag is not here: its spelling depends on the PHP version, see PIC_FLAG
-    # in the build steps.
+    # Configure flags for the macOS interpreter build (JIT disabled - incompatible with
+    # php-debugger). The PIC flag is not here: its spelling depends on the PHP version,
+    # see PIC_FLAG in the build step. The Linux interpreter is built with StaticPHP,
+    # see .github/scripts/build-linux-interpreter.sh.
     CONFIGURE_FLAGS: >-
       --with-mhash
       --enable-mbstring
@@ -60,8 +61,6 @@ env:
     # macOS-specific flags (iconv path is set dynamically from SDK, using system sqlite and curl)
     MACOS_FLAGS: --with-pdo-sqlite --with-sqlite3 --without-readline --with-curl
 
-    # Linux-specific flags
-    LINUX_FLAGS: --with-pdo-sqlite=/usr --with-sqlite3=/usr --with-iconv --with-readline --with-curl
 
 jobs:
     # A `push: tags` run always has a real, already-existing tag (RELEASE_REF
@@ -459,92 +458,41 @@ jobs:
                 uses: actions/checkout@v7
                 with:
                     ref: ${{ env.RELEASE_REF }}
-                    path: ext-src
 
-            -   name: Install build dependencies
-                run: |
-                    sudo apt-get update
-                    sudo apt-get install -y autoconf automake libtool pkg-config \
-                      libxml2-dev libsqlite3-dev libcurl4-openssl-dev libssl-dev libreadline-dev \
-                      libsodium-dev libargon2-dev libonig-dev build-essential
-
-            -   name: Fetch PHP source
+            # Built with StaticPHP in the image in .github/builders/interpreter:
+            # every library linked in except glibc, so it runs on any distro with
+            # glibc 2.34+ and can still load shared extensions. The build script
+            # also checks the linked libraries, the glibc version, the extensions,
+            # and runs a DBGp smoke test.
+            -   name: Build PHP with static php_debugger
                 env:
                     PHP_URL: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].url }}
                     PHP_SHA256: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].sha256 }}
-                run: sh ext-src/.github/scripts/fetch-php-source.sh "$PHP_URL" "$PHP_SHA256" ~/php-src
-
-            -   name: Copy extension into php-src
+                    # StaticPHP looks up its library sources through the GitHub API
+                    GITHUB_TOKEN: ${{ github.token }}
                 run: |
-                    cp -r ext-src ~/php-src/ext/php_debugger
-                    mkdir -p ~/php-src/m4
-                    cp ext-src/m4/*.m4 ~/php-src/m4/
+                    docker build -q -t php-debugger-interpreter-builder .github/builders/interpreter
+                    mkdir -p dist
+                    docker run --rm -e GITHUB_TOKEN \
+                      -v "$PWD:/ext:ro" \
+                      -v "$PWD/dist:/out" \
+                      php-debugger-interpreter-builder \
+                      sh /ext/.github/scripts/build-linux-interpreter.sh "$PHP_URL" "$PHP_SHA256" "${{ matrix.ts }}" /ext \
+                        "/out/php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}"
 
-            -   name: Build PHP with static php_debugger
+            -   name: Check it runs on other distros
                 run: |
-                    cd ~/php-src
-                    ./buildconf --force
-
-                    # PHP 8.6 bundles Libtool 2.5, which rejects --with-pic in favor of
-                    # --enable-pic; 8.2-8.5 bundle Libtool 1.5, which only knows --with-pic
-                    # (and would merely warn about --enable-pic, silently building without it).
-                    case "${{ matrix.php-version }}" in
-                        8.[2-5]) PIC_FLAG=--with-pic ;;
-                        *) PIC_FLAG=--enable-pic ;;
-                    esac
-
-                    ./configure \
-                      --with-config-file-path=/usr/local/etc/php \
-                      --with-config-file-scan-dir=/usr/local/etc/php/conf.d \
-                      $CONFIGURE_FLAGS \
-                      $PIC_FLAG \
-                      $LINUX_FLAGS \
-                      ${{ matrix.ts == 'ts' && '--enable-zts' || '' }}
-                    # PHP= keeps the Zend VM files generated in the release tag. Otherwise make
-                    # regenerates them with whatever php the runner has, and PHP 8.2's
-                    # generator writes a broken zend_vm_opcodes.h when that php defines
-                    # ZEND_VM_KIND itself (PHP 8.5 does). The regeneration is skipped when
-                    # $(PHP) is empty: see the vm.gen.intermediate rule in Zend/Makefile.frag.
-                    make -j$(nproc) PHP=
-
-            -   name: Verify extension is statically linked
-                run: |
-                    cd ~/php-src
-                    ./sapi/cli/php -m | grep -q php_debugger
-                    ./sapi/cli/php -v | grep -q "PHP Debugger"
-
-            -   name: Test extension functionality
-                run: |
-                    cd ~/php-src
-                    ./sapi/cli/php -r "
-                      assert(extension_loaded('php_debugger'), 'php_debugger not loaded');
-                      assert(function_exists('xdebug_break'), 'xdebug_break missing');
-                      assert(function_exists('xdebug_info'), 'xdebug_info missing');
-                      assert(function_exists('php_debugger_info'), 'php_debugger_info missing');
-                      assert(ini_get('xdebug.client_port') !== false, 'xdebug.* INI missing');
-                      assert(ini_get('php_debugger.client_port') !== false, 'php_debugger.* INI missing');
-                      echo 'All tests passed!' . PHP_EOL;
-                    "
-
-            -   name: Package artifact
-                id: package
-                run: |
-                    cd ~/php-src
-                    PHP_VER="${{ matrix.php-version }}"
-                    OS_TAG="linux"
-                    ARCH_TAG="${{ matrix.arch.arch }}"
-                    TS_TAG="${{ matrix.ts }}"
-                    ASSET_NAME="php-php${PHP_VER}-${TS_TAG}-${OS_TAG}-${ARCH_TAG}"
-                    cp sapi/cli/php "${ASSET_NAME}"
-                    chmod +x "${ASSET_NAME}"
-                    echo "asset_name=${ASSET_NAME}" >> $GITHUB_OUTPUT
-                    echo "asset_path=${HOME}/php-src/${ASSET_NAME}" >> $GITHUB_OUTPUT
+                    for image in debian:12-slim ubuntu:22.04 ubuntu:26.04; do
+                        echo "== ${image}"
+                        docker run --rm -v "$PWD/dist:/dist:ro" "$image" \
+                          /dist/php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }} -n -v
+                    done
 
             -   name: Upload artifact
                 uses: actions/upload-artifact@v6
                 with:
-                    name: release--${{ steps.package.outputs.asset_name }}
-                    path: ${{ steps.package.outputs.asset_path }}
+                    name: release--php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}
+                    path: dist/
 
     # Lives in its own reusable workflow so pull requests that change it are
     # built and tested on Windows runners without cutting a release.
