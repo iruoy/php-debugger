@@ -195,25 +195,47 @@ fi
 #   with bundled PCRE2 use (the official Docker images, PECL builds). The
 #   distributions' and Homebrew's PHP use the system PCRE2 instead, so their
 #   extensions call the standard pcre2_*_8 names, and on Linux bind them when
-#   they load. Export every bundled function under its standard name too, as
-#   an alias of the same function, so both kinds of extensions load.
+#   they load. Export every bundled function under its standard name too: a
+#   stub that tail-jumps to it, so there is still one PCRE2 and the arguments
+#   pass through untouched. The stubs are appended to ext/pcre/php_pcre.c, so
+#   they are compiled once into PHP itself (zig's linker has no --defsym).
 if [ "$OS" = Darwin ]; then
     export SPC_DEFAULT_LDFLAGS=""
 fi
-# Only functions get an alias: php_compat.h also renames a typedef
+# Only functions get a stub: php_compat.h also renames a typedef
 # (pcre2_jit_callback), recognisable as not being declared as "name(" in pcre2.h.
 PCRE2_NAMES=$(sed -n 's/^#define[[:space:]]*\(pcre2_[a-z0-9_]*_8\)[[:space:]]*\(php_pcre2_[a-z0-9_]*\)[[:space:]]*$/\2 \1/p' "$PHP_SRC/main/php_compat.h" \
     | while read -r bundled standard; do
         grep -q "\b${standard%_8}(" "$PHP_SRC/ext/pcre/pcre2lib/pcre2.h" && echo "$bundled $standard"
     done)
 [ -n "$PCRE2_NAMES" ] || { echo "error: no PCRE2 names found in main/php_compat.h" >&2; exit 1; }
-if [ "$OS" = Linux ]; then
-    PCRE2_ALIASES=$(echo "$PCRE2_NAMES" | awk '{ printf " -Wl,--defsym=%s=%s", $2, $1 }')
-else
-    PCRE2_ALIASES=$(echo "$PCRE2_NAMES" | awk '{ printf " -Wl,-alias,_%s,_%s", $1, $2 }')
-fi
+{
+    cat <<'EOF'
+
+#ifdef HAVE_BUNDLED_PCRE
+/* Added by php-debugger's release build (.github/scripts/build-interpreter.sh):
+ * every bundled PCRE2 function is also exported under its standard name, for
+ * extensions built against a PHP that uses the system PCRE2. Each stub
+ * tail-jumps to the bundled function, so the arguments pass through untouched. */
+#if defined(__APPLE__) && defined(__aarch64__)
+#  define PHP_DEBUGGER_PCRE2_ALIAS(standard, bundled) \
+	__asm__(".text\n.globl _" standard "\n.p2align 2\n_" standard ":\n\tb _" bundled "\n");
+#elif defined(__aarch64__)
+#  define PHP_DEBUGGER_PCRE2_ALIAS(standard, bundled) \
+	__asm__(".text\n.globl " standard "\n.type " standard ", %function\n.p2align 2\n" standard ":\n\tb " bundled "\n");
+#elif defined(__x86_64__) && !defined(__APPLE__)
+#  define PHP_DEBUGGER_PCRE2_ALIAS(standard, bundled) \
+	__asm__(".text\n.globl " standard "\n.type " standard ", @function\n" standard ":\n\tjmp " bundled "\n");
+#else
+#  error "no PCRE2 alias stub for this platform"
+#endif
+EOF
+    echo "$PCRE2_NAMES" | while read -r bundled standard; do
+        echo "PHP_DEBUGGER_PCRE2_ALIAS(\"$standard\", \"$bundled\")"
+    done
+    echo "#endif"
+} >> "$PHP_SRC/ext/pcre/php_pcre.c"
 echo "PCRE2 standard names: $(echo "$PCRE2_NAMES" | wc -l | tr -d ' ')"
-export SPC_CMD_VAR_PHP_MAKE_EXTRA_LDFLAGS_PROGRAM="$PCRE2_ALIASES"
 # --no-smoke-test: the checks below cover the same (the binary runs, the
 # extensions load) plus the debugger itself
 SPC_CMD_PREFIX_PHP_CONFIGURE="./configure $PATHS --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger ac_cv_have_decl_epoll_pwait2=no" \
@@ -277,7 +299,8 @@ else
     EXPORTED=$(nm -gU "$PHP" | awk '{print $3}' | sed 's/^_//')
 fi
 for symbol in zend_parse_parameters zend_declare_property add_next_index_bool _emalloc_3072 php_pcre2_match pcre2_match_8; do
-    echo "$EXPORTED" | grep -qx "$symbol" || { echo "error: the interpreter does not export $symbol, shared extensions will not load" >&2; exit 1; }
+    # Not grep -q: it stops reading early, and the writer then fails on the closed pipe
+    printf '%s\n' "$EXPORTED" | grep -x "$symbol" >/dev/null || { echo "error: the interpreter does not export $symbol, shared extensions will not load" >&2; exit 1; }
 done
 echo "Exports the PHP API: $(echo "$EXPORTED" | grep -c '^zend_\|^php_\|^add_\|^_e') symbols"
 
