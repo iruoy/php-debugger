@@ -22,9 +22,10 @@ on:
 permissions:
   contents: read
 
-# A newer push to a pull request supersedes its older run
+# A newer push to a pull request supersedes its older run; other runs
+# (pushes, manual runs) each get their own group, so none is dropped
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

@@ -102,8 +102,10 @@ jobs:
                 if: github.event_name != 'pull_request'
                 env:
                     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                    # Through the environment, not the script text: on a manual run
+                    # it is free-text input, checked only by the script itself
+                    TAG: ${{ env.RELEASE_REF }}
                 run: |
-                    TAG="${{ env.RELEASE_REF }}"
                     if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
                         if ! [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
                             echo "::error::'${TAG}' doesn't look like a version (expected X.Y.Z or X.Y.Z-suffix)"
@@ -207,9 +209,12 @@ jobs:
                     GITHUB_TOKEN: ${{ github.token }}
                 run: sh .github/scripts/build-interpreter.sh libs-build "$RUNNER_TEMP/staticphp-libs.tar.gz"
 
-            # Release runs save what they built, for pull request runs to use
+            # Release runs save what they built, for pull request runs to use. Only
+            # runs on the default branch (prepare-release.yml dispatches from main)
+            # save to a cache scope pull requests can read; a run for a pushed tag
+            # could not share it.
             -   name: Save the libraries for pull requests
-                if: github.event_name != 'pull_request'
+                if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
                 uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
                 with:
                     path: ${{ runner.temp }}/staticphp-libs.tar.gz
@@ -221,7 +226,9 @@ jobs:
                     # Not release--*: only shared between jobs, never published
                     name: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
                     path: ${{ runner.temp }}/staticphp-libs.tar.gz
-                    retention-days: 1
+                    # As long as the release assets: rerunning failed interpreter
+                    # jobs reuses this run's libraries
+                    retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
                     # Already a .tar.gz
                     compression-level: 0
 
@@ -250,11 +257,20 @@ jobs:
                 env:
                     phpts: ${{ matrix.ts }}
 
+            # For MIN_MACOS and newer, not just the runner's macOS
             -   name: Build extension
+                env:
+                    MACOSX_DEPLOYMENT_TARGET: ${{ env.MIN_MACOS }}
                 run: |
                     phpize
                     ./configure --enable-php-debugger
                     make -j$(sysctl -n hw.logicalcpu 2>/dev/null || nproc)
+                    MINOS=$(otool -l modules/php_debugger.so | awk '/LC_BUILD_VERSION/ { found = 1 } found && $1 == "minos" { print $2; exit }')
+                    echo "Requires macOS: $MINOS"
+                    if [ -z "$MINOS" ] || [ "$(printf '%s\n%s\n' "$MINOS" "$MIN_MACOS" | sort -V | tail -1)" != "$MIN_MACOS" ]; then
+                        echo "error: the extension needs macOS '${MINOS}', not at most ${MIN_MACOS}" >&2
+                        exit 1
+                    fi
 
             # Loads, and a debug client can attach and drive a script
             -   name: Test extension
@@ -341,15 +357,33 @@ jobs:
                     B="$RUNNER_TEMP/php-debugger-build"
                     sh .github/scripts/check-baseline-cpu.sh "$B/php/bin/php" . -d zend_extension="$B/ext/modules/php_debugger.so"
 
-            # The runner cannot run a musl PHP, so test in the official Alpine image
-            # of the same version and thread safety. There is none for NTS 8.6+:
-            # from 8.6 on the official images are ZTS only (and -zts is gone).
+            # The runner cannot run a musl PHP, so test in Alpine: in the official
+            # image of the same version and thread safety, or for NTS 8.6+ (from 8.6
+            # on the official images are ZTS only, and Alpine has no PHP 8.6 package
+            # yet) in plain Alpine, with PHP built from the same tarball
             -   name: Test in Alpine
-                if: matrix.libc == 'musl' && (matrix.ts == 'ts' || contains(fromJSON('["8.2", "8.3", "8.4", "8.5"]'), matrix.php-version))
+                if: matrix.libc == 'musl'
                 env:
-                    IMAGE: php:${{ matrix.php-version }}-${{ (matrix.ts == 'ts' && contains(fromJSON('["8.2", "8.3", "8.4", "8.5"]'), matrix.php-version)) && 'zts' || 'cli' }}-alpine
+                    PHP_URL: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].url }}
+                    PHP_SHA256: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].sha256 }}
                 run: |
-                    docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/out:/out:ro" "$IMAGE" sh -euc '
+                    VER="${{ matrix.php-version }}"
+                    case "${{ matrix.ts }}-$VER" in
+                        nts-8.[2-5]) IMAGE="php:$VER-cli-alpine" ;;
+                        ts-8.[2-5]) IMAGE="php:$VER-zts-alpine" ;;
+                        ts-*) IMAGE="php:$VER-cli-alpine" ;;
+                        *) IMAGE=alpine:3 ;;
+                    esac
+                    echo "Testing in $IMAGE"
+                    docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/out:/out:ro" -e PHP_URL -e PHP_SHA256 "$IMAGE" sh -euc '
+                        if ! command -v php >/dev/null; then
+                            apk add -q build-base linux-headers curl xz
+                            sh /src/.github/scripts/fetch-php-source.sh "$PHP_URL" "$PHP_SHA256" /tmp/php-src
+                            cd /tmp/php-src
+                            ./configure --quiet --disable-all --disable-cgi --disable-phpdbg
+                            make -s -j"$(nproc)" >/dev/null
+                            make -s install >/dev/null
+                        fi
                         php -n -d zend_extension=/out/php_debugger.so -v
                         sh /src/.github/scripts/smoke-test.sh "$(command -v php)" /src -d zend_extension=/out/php_debugger.so
                     '
