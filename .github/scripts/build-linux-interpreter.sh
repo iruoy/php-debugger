@@ -19,7 +19,8 @@ PHP_URL="$1"
 PHP_SHA256="$2"
 TS="$3"
 EXT_SRC=$(cd "$4" && pwd)
-OUT="$5"
+# Absolute, since the script changes directories
+OUT="$(cd "$(dirname "$5")" && pwd)/$(basename "$5")"
 
 # The extensions the interpreter is built with; php_debugger is added below
 EXTENSIONS="ctype,curl,dom,fileinfo,filter,iconv,mbstring,mysqlnd,opcache,openssl,password-argon2,pdo,pdo_sqlite,phar,posix,readline,session,simplexml,sodium,sqlite3,tokenizer,xml,xmlreader,xmlwriter,zlib"

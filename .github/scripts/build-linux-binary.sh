@@ -25,7 +25,9 @@ PHP_SHA256="$2"
 TS="$3"
 TARGET="$4"
 EXT_SRC=$(cd "$5" && pwd)
-OUT_DIR="$6"
+# Absolute, since the script changes directories
+mkdir -p "$6"
+OUT_DIR=$(cd "$6" && pwd)
 
 WORK="${RUNNER_TEMP:-/tmp}/php-debugger-build"
 rm -rf "$WORK"
