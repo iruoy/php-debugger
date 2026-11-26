@@ -9,7 +9,8 @@
 # when it keeps a replaced PHP's extensions.
 #
 # Needs MAX_GLIBC and GITHUB_TOKEN in the environment (StaticPHP looks up its
-# library sources through the GitHub API), and re2c and gettext installed.
+# library sources through the GitHub API), PHP 8.4+ and composer to run
+# StaticPHP (the GitHub runners have both), and re2c and gettext installed.
 #
 # Usage: build-linux-interpreter.sh <php tarball url> <sha256> <nts|ts> <extension source dir> <output file>
 # (the tarball as resolved by resolve-php-sources.py)
@@ -30,8 +31,17 @@ rm -rf "$WORK"
 mkdir -p "$WORK/bin"
 cd "$WORK"
 
-# StaticPHP v3 is not released yet; its nightly is the only build with PHP 8.6 support
-curl -fsSL --retry 3 -o "$WORK/bin/spc" "https://dl.static-php.dev/v3/spc-bin/nightly/spc-linux-$(uname -m)"
+# StaticPHP v3 has no release yet, and its only prebuilt binary is an unversioned
+# nightly, so it runs from source at a pinned commit of its v3 branch (the first
+# version with PHP 8.6 support), with its dependencies from its composer.lock.
+# Bump the commit by hand; switch to a release once v3 has one.
+STATICPHP_COMMIT=4193678111e6841b434348d76c94feadf7086542
+curl -fsSL --retry 3 "https://github.com/crazywhalecc/static-php-cli/archive/${STATICPHP_COMMIT}.tar.gz" | tar -xz -C "$WORK"
+mv "$WORK/static-php-cli-${STATICPHP_COMMIT}" "$WORK/staticphp-src"
+# The runner's PHP (8.4+ needed) has Xdebug enabled, which only slows StaticPHP down
+export XDEBUG_MODE=off
+composer install --working-dir="$WORK/staticphp-src" --no-dev --no-interaction --no-progress --prefer-dist --quiet
+printf '#!/bin/sh\nexec php "%s/staticphp-src/bin/spc" "$@"\n' "$WORK" > "$WORK/bin/spc"
 chmod +x "$WORK/bin/spc"
 export PATH="$WORK/bin:$PATH"
 spc --version
