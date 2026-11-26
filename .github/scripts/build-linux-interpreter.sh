@@ -58,8 +58,10 @@ mkdir -p "$PHP_SRC/m4"
 cp "$EXT_SRC"/m4/*.m4 "$PHP_SRC/m4/"
 
 # Link against glibc instead of musl, targeting the oldest version supported.
-# With a target set, StaticPHP builds with its zig toolchain.
-export SPC_TARGET="native-native-gnu.${MAX_GLIBC}"
+# With a target set, StaticPHP builds with its zig toolchain. The architecture
+# is named explicitly: "native" would also mean the runner's CPU, and zig would
+# use instructions that older CPUs (and Apple Silicon VMs) do not have.
+export SPC_TARGET="$(uname -m)-linux-gnu.${MAX_GLIBC}"
 
 spc doctor --auto-fix
 # Registers the PHP source; the build downloads the libraries and toolchain it needs

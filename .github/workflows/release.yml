@@ -232,6 +232,16 @@ jobs:
                           /b/php/bin/php -n -d zend_extension=/b/ext/modules/php_debugger.so -r 'exit(extension_loaded("php_debugger") ? 0 : 1);'
                     done
 
+            # GitHub's runners have recent CPUs; run on the oldest CPU model of the
+            # architecture too, so instructions older CPUs lack fail here instead of
+            # on users' machines. (The musl build uses the same compiler settings.)
+            -   name: Check it runs on a baseline CPU
+                if: matrix.libc == 'glibc'
+                run: |
+                    sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user >/dev/null
+                    B="$RUNNER_TEMP/php-debugger-build"
+                    sh .github/scripts/check-baseline-cpu.sh "$B/php/bin/php" . -d "zend_extension=$B/ext/modules/php_debugger.so"
+
             # The runner cannot run a musl PHP, so test in the official Alpine image
             # of the same version and thread safety. There is none for NTS 8.6: from
             # 8.6 on the official images are ZTS only.
@@ -491,7 +501,7 @@ jobs:
                     ref: ${{ env.RELEASE_REF }}
 
             -   name: Install build dependencies
-                run: sudo apt-get install -y re2c gettext
+                run: sudo apt-get update -qq && sudo apt-get install -y -qq re2c gettext qemu-user
 
             # Built with StaticPHP: every library linked in except glibc, which its
             # zig toolchain targets at MAX_GLIBC, so it runs on any distro with that
@@ -508,6 +518,12 @@ jobs:
                     mkdir -p dist
                     sh .github/scripts/build-linux-interpreter.sh "$PHP_URL" "$PHP_SHA256" "${{ matrix.ts }}" . \
                       "dist/php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}"
+
+            # GitHub's runners have recent CPUs; run on the oldest CPU model of the
+            # architecture too, so instructions older CPUs lack fail here instead of
+            # on users' machines
+            -   name: Check it runs on a baseline CPU
+                run: sh .github/scripts/check-baseline-cpu.sh "dist/php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}" .
 
             -   name: Check it runs on other distros
                 run: |
