@@ -8,13 +8,72 @@
 # It can still load shared extensions, which php-debugger/installer relies on
 # when it keeps a replaced PHP's extensions.
 #
+# Two steps, so the libraries are built once per architecture instead of once
+# per PHP version and thread-safety mode (they depend on neither):
+#   libs <output archive>
+#       builds the libraries (and fetches StaticPHP's zig toolchain) and packs
+#       StaticPHP's buildroot/ and pkgroot/ into an archive
+#   php <php tarball url> <sha256> <nts|ts> <extension source dir> <output file> [libs archive]
+#       builds the interpreter; with the archive from "libs", StaticPHP finds
+#       those libraries already built and only builds PHP (anything missing from
+#       the archive it still builds itself)
+# (the tarball as resolved by resolve-php-sources.py)
+#
 # Needs MAX_GLIBC and GITHUB_TOKEN in the environment (StaticPHP looks up its
 # library sources through the GitHub API), PHP 8.4+ and composer to run
 # StaticPHP (the GitHub runners have both), and re2c and gettext installed.
-#
-# Usage: build-linux-interpreter.sh <php tarball url> <sha256> <nts|ts> <extension source dir> <output file>
-# (the tarball as resolved by resolve-php-sources.py)
 set -eu
+
+MODE="$1"
+shift
+
+# The extensions the interpreter is built with; php_debugger is added below
+EXTENSIONS="ctype,curl,dom,fileinfo,filter,iconv,mbstring,mysqlnd,opcache,openssl,password-argon2,pdo,pdo_sqlite,phar,posix,readline,session,simplexml,sodium,sqlite3,tokenizer,xml,xmlreader,xmlwriter,zlib"
+# The libraries those extensions need, built by the "libs" step. Keep in sync:
+# a library missing here is still built by every "php" step, just not shared.
+LIBRARIES="zlib,openssl,libiconv,xz,libxml2,libsodium,ncurses,libedit,curl,libargon2,sqlite"
+
+# Link against glibc instead of musl, targeting the oldest version supported.
+# With a target set, StaticPHP builds with its zig toolchain. The architecture
+# is named explicitly: "native" would also mean the runner's CPU, and zig would
+# use instructions that older CPUs (and Apple Silicon VMs) do not have.
+export SPC_TARGET="$(uname -m)-linux-gnu.${MAX_GLIBC}"
+
+WORK="${RUNNER_TEMP:-/tmp}/staticphp"
+
+setup_staticphp() {
+    rm -rf "$WORK"
+    mkdir -p "$WORK/bin"
+    cd "$WORK"
+    # StaticPHP v3 has no release yet, and its only prebuilt binary is an
+    # unversioned nightly, so it runs from source at a pinned commit of its v3
+    # branch (the first version with PHP 8.6 support), with its dependencies from
+    # its composer.lock. Bump the commit by hand; switch to a release once v3 has one.
+    STATICPHP_COMMIT=4193678111e6841b434348d76c94feadf7086542
+    curl -fsSL --retry 3 "https://github.com/crazywhalecc/static-php-cli/archive/${STATICPHP_COMMIT}.tar.gz" | tar -xz -C "$WORK"
+    mv "$WORK/static-php-cli-${STATICPHP_COMMIT}" "$WORK/staticphp-src"
+    # The runner's PHP (8.4+ needed) has Xdebug enabled, which only slows
+    # StaticPHP down. XDEBUG_MODE is set for these commands only: php_debugger
+    # reads it too, so exporting it would also switch the debugger off in the
+    # smoke test below.
+    XDEBUG_MODE=off composer install --working-dir="$WORK/staticphp-src" --no-dev --no-interaction --no-progress --prefer-dist --quiet
+    printf '#!/bin/sh\nXDEBUG_MODE=off exec php "%s/staticphp-src/bin/spc" "$@"\n' "$WORK" > "$WORK/bin/spc"
+    chmod +x "$WORK/bin/spc"
+    export PATH="$WORK/bin:$PATH"
+    spc --version
+    spc doctor --auto-fix
+}
+
+if [ "$MODE" = libs ]; then
+    OUT="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+    setup_staticphp
+    spc build:libs "$LIBRARIES" || { tail -n 60 "$WORK/log/spc.shell.log" >&2; exit 1; }
+    tar -czf "$OUT" -C "$WORK" buildroot pkgroot
+    ls -la "$OUT"
+    exit 0
+fi
+
+[ "$MODE" = php ] || { echo "usage: $0 libs <archive> | php <url> <sha256> <nts|ts> <extension source dir> <output file> [libs archive]" >&2; exit 2; }
 
 PHP_URL="$1"
 PHP_SHA256="$2"
@@ -22,30 +81,13 @@ TS="$3"
 EXT_SRC=$(cd "$4" && pwd)
 # Absolute, since the script changes directories
 OUT="$(cd "$(dirname "$5")" && pwd)/$(basename "$5")"
+LIBS_ARCHIVE=""
+[ $# -ge 6 ] && LIBS_ARCHIVE="$(cd "$(dirname "$6")" && pwd)/$(basename "$6")"
 
-# The extensions the interpreter is built with; php_debugger is added below
-EXTENSIONS="ctype,curl,dom,fileinfo,filter,iconv,mbstring,mysqlnd,opcache,openssl,password-argon2,pdo,pdo_sqlite,phar,posix,readline,session,simplexml,sodium,sqlite3,tokenizer,xml,xmlreader,xmlwriter,zlib"
-
-WORK="${RUNNER_TEMP:-/tmp}/staticphp"
-rm -rf "$WORK"
-mkdir -p "$WORK/bin"
-cd "$WORK"
-
-# StaticPHP v3 has no release yet, and its only prebuilt binary is an unversioned
-# nightly, so it runs from source at a pinned commit of its v3 branch (the first
-# version with PHP 8.6 support), with its dependencies from its composer.lock.
-# Bump the commit by hand; switch to a release once v3 has one.
-STATICPHP_COMMIT=4193678111e6841b434348d76c94feadf7086542
-curl -fsSL --retry 3 "https://github.com/crazywhalecc/static-php-cli/archive/${STATICPHP_COMMIT}.tar.gz" | tar -xz -C "$WORK"
-mv "$WORK/static-php-cli-${STATICPHP_COMMIT}" "$WORK/staticphp-src"
-# The runner's PHP (8.4+ needed) has Xdebug enabled, which only slows StaticPHP
-# down. XDEBUG_MODE is set for these commands only: php_debugger reads it too,
-# so exporting it would also switch the debugger off in the smoke test below.
-XDEBUG_MODE=off composer install --working-dir="$WORK/staticphp-src" --no-dev --no-interaction --no-progress --prefer-dist --quiet
-printf '#!/bin/sh\nXDEBUG_MODE=off exec php "%s/staticphp-src/bin/spc" "$@"\n' "$WORK" > "$WORK/bin/spc"
-chmod +x "$WORK/bin/spc"
-export PATH="$WORK/bin:$PATH"
-spc --version
+setup_staticphp
+if [ -n "$LIBS_ARCHIVE" ]; then
+    tar -xzf "$LIBS_ARCHIVE" -C "$WORK"
+fi
 
 # PHP source: the php.net tarball, with the debugger added as a bundled extension.
 # It goes where StaticPHP keeps the PHP source (source/php-src): for a local
@@ -57,34 +99,34 @@ rm -rf "$PHP_SRC/ext/php_debugger/.git"
 mkdir -p "$PHP_SRC/m4"
 cp "$EXT_SRC"/m4/*.m4 "$PHP_SRC/m4/"
 
-# Link against glibc instead of musl, targeting the oldest version supported.
-# With a target set, StaticPHP builds with its zig toolchain. The architecture
-# is named explicitly: "native" would also mean the runner's CPU, and zig would
-# use instructions that older CPUs (and Apple Silicon VMs) do not have.
-export SPC_TARGET="$(uname -m)-linux-gnu.${MAX_GLIBC}"
-
-spc doctor --auto-fix
-# Registers the PHP source; the build downloads the libraries and toolchain it needs
+# Registers the PHP source; the build downloads whatever else it still needs
 spc download php-src --custom-local="php-src:$PHP_SRC"
 
 # StaticPHP's default configure command (config/env.ini, [linux]) plus the
 # debugger and the mhash functions, which StaticPHP has no option for. zig ships
 # the newest glibc headers and only limits the symbols that link; PHP 8.6
 # enables epoll_pwait2 (glibc 2.35+) whenever the headers declare it, so rule
-# it out (an optional fast path for PHP). PHP 8.6 bundles Libtool 2.5, which rejects --with-pic in favour of
-# --enable-pic; 8.2-8.5 bundle Libtool 1.5, which only knows --with-pic.
+# it out (an optional fast path for PHP). PHP 8.6 bundles Libtool 2.5, which
+# rejects --with-pic in favour of --enable-pic; 8.2-8.5 bundle Libtool 1.5,
+# which only knows --with-pic.
 case "$(grep -o 'PHP_VERSION "[0-9]*\.[0-9]*' "$PHP_SRC/main/php_version.h" | cut -d'"' -f2)" in
     8.[2-5]) PIC_FLAG=--with-pic ;;
     *) PIC_FLAG=--enable-pic ;;
 esac
 ZTS_ARG=""
 [ "$TS" = "ts" ] && ZTS_ARG="--enable-zts"
-SPC_CMD_PREFIX_PHP_CONFIGURE="./configure --prefix= --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-rtld-now --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger ac_cv_have_decl_epoll_pwait2=no" \
+if ! SPC_CMD_PREFIX_PHP_CONFIGURE="./configure --prefix= --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-rtld-now --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger ac_cv_have_decl_epoll_pwait2=no" \
     spc build:php-cli "$EXTENSIONS" $ZTS_ARG \
         --disable-opcache-jit \
         --with-config-file-path=/usr/local/etc/php \
         --with-config-file-scan-dir=/usr/local/etc/php/conf.d \
-    || { tail -n 60 "$WORK/log/spc.shell.log" >&2; exit 1; }
+        > "$WORK/build.log" 2>&1
+then
+    cat "$WORK/build.log"
+    tail -n 60 "$WORK/log/spc.shell.log" >&2
+    exit 1
+fi
+cat "$WORK/build.log"
 
 PHP="$WORK/buildroot/bin/php"
 file "$PHP"

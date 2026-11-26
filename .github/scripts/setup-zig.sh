@@ -7,6 +7,10 @@
 #
 # Afterwards, put <dir>/bin on PATH and use CC=zcc CXX=zcxx AR=zar RANLIB=zranlib.
 #
+# If ZIG_CACHE_DIR is set, zig is kept there (one directory per version and
+# architecture) and only downloaded when it is not there yet, e.g. when the
+# workflow restores that directory with actions/cache.
+#
 # Usage: setup-zig.sh <zig target> <dir>
 set -eu
 
@@ -21,11 +25,17 @@ case "$(uname -m)" in
     *) echo "error: no zig for $(uname -m)" >&2; exit 1 ;;
 esac
 
-mkdir -p "$DIR/zig" "$DIR/bin"
-curl -fsSL --retry 3 -o "$DIR/zig.tar.xz" "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
-echo "$ZIG_SHA256  $DIR/zig.tar.xz" | sha256sum -c -
-tar -xJf "$DIR/zig.tar.xz" --strip-components=1 -C "$DIR/zig"
-rm -f "$DIR/zig.tar.xz"
+ZIG="${ZIG_CACHE_DIR:-$DIR}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}"
+if [ -x "$ZIG/zig" ]; then
+    echo "Using cached zig in $ZIG"
+else
+    mkdir -p "$ZIG"
+    curl -fsSL --retry 3 -o "$ZIG.tar.xz" "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
+    echo "$ZIG_SHA256  $ZIG.tar.xz" | sha256sum -c -
+    tar -xJf "$ZIG.tar.xz" --strip-components=1 -C "$ZIG"
+    rm -f "$ZIG.tar.xz"
+fi
+mkdir -p "$DIR/bin"
 
 # -fno-sanitize=all: zig enables UBSan unless optimizing, which must not end up
 # in release binaries (and aborts PHP 8.6's build-time JIT generators).
@@ -34,10 +44,10 @@ rm -f "$DIR/zig.tar.xz"
 for tool in cc:zcc c++:zcxx; do
     cat > "$DIR/bin/${tool#*:}" <<EOF
 #!/bin/sh
-exec "$DIR/zig/zig" ${tool%%:*} -target $TARGET -fno-sanitize=all -Wno-error=date-time "\$@"
+exec "$ZIG/zig" ${tool%%:*} -target $TARGET -fno-sanitize=all -Wno-error=date-time "\$@"
 EOF
 done
-printf '#!/bin/sh\nexec "%s/zig/zig" ar "$@"\n' "$DIR" > "$DIR/bin/zar"
-printf '#!/bin/sh\nexec "%s/zig/zig" ranlib "$@"\n' "$DIR" > "$DIR/bin/zranlib"
+printf '#!/bin/sh\nexec "%s/zig" ar "$@"\n' "$ZIG" > "$DIR/bin/zar"
+printf '#!/bin/sh\nexec "%s/zig" ranlib "$@"\n' "$ZIG" > "$DIR/bin/zranlib"
 chmod +x "$DIR/bin/zcc" "$DIR/bin/zcxx" "$DIR/bin/zar" "$DIR/bin/zranlib"
-"$DIR/zig/zig" version
+"$ZIG/zig" version

@@ -210,11 +210,19 @@ jobs:
                 with:
                     ref: ${{ env.RELEASE_REF }}
 
+            # The pinned zig (see setup-zig.sh), kept between runs
+            -   name: Cache zig
+                uses: actions/cache@v6
+                with:
+                    path: ${{ runner.temp }}/zig-cache
+                    key: zig-${{ runner.arch }}-${{ hashFiles('.github/scripts/setup-zig.sh') }}
+
             # Built with zig for the target libc (glibc MAX_GLIBC or musl), so the
             # binary does not depend on the runner's glibc; see the build script,
             # which also runs the glibc build's load check and DBGp smoke test
             -   name: Build extension
                 env:
+                    ZIG_CACHE_DIR: ${{ runner.temp }}/zig-cache
                     PHP_URL: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].url }}
                     PHP_SHA256: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].sha256 }}
                     TARGET: ${{ matrix.arch.arch == 'arm64' && 'aarch64' || 'x86_64' }}-linux-${{ matrix.libc == 'glibc' && format('gnu.{0}', env.MAX_GLIBC) || 'musl' }}
@@ -475,8 +483,46 @@ jobs:
                     name: release--${{ steps.package.outputs.asset_name }}
                     path: ${{ steps.package.outputs.asset_path }}
 
+    # The libraries the Linux interpreters link in statically depend only on the
+    # architecture, not on the PHP version or thread safety, so they are built
+    # once per architecture here and shared by the build-php-linux jobs.
+    build-php-linux-libs:
+        needs: validate-tag
+        strategy:
+            fail-fast: false
+            matrix:
+                arch:
+                    - runner: ubuntu-26.04
+                      arch: x86_64
+                    - runner: ubuntu-26.04-arm
+                      arch: arm64
+        runs-on: ${{ matrix.arch.runner }}
+        name: "PHP Binary Linux libraries — ${{ matrix.arch.arch }}"
+        steps:
+            -   name: Checkout extension
+                uses: actions/checkout@v7
+                with:
+                    ref: ${{ env.RELEASE_REF }}
+
+            -   name: Install build dependencies
+                run: sudo apt-get update -qq && sudo apt-get install -y -qq re2c gettext
+
+            -   name: Build the libraries
+                env:
+                    # StaticPHP looks up its library sources through the GitHub API
+                    GITHUB_TOKEN: ${{ github.token }}
+                run: sh .github/scripts/build-linux-interpreter.sh libs "$RUNNER_TEMP/staticphp-libs.tar.gz"
+
+            -   name: Upload libraries
+                uses: actions/upload-artifact@v6
+                with:
+                    # Not release--*: only shared between jobs, never published
+                    name: staticphp-libs-${{ matrix.arch.arch }}
+                    path: ${{ runner.temp }}/staticphp-libs.tar.gz
+                    retention-days: 1
+
     build-php-linux:
-        needs: [validate-tag, resolve-php-versions]
+        needs: [validate-tag, resolve-php-versions, build-php-linux-libs]
         strategy:
             fail-fast: false
             matrix:
@@ -510,6 +556,12 @@ jobs:
             # glibc or newer and can still load shared extensions. The build script
             # also checks the linked libraries, the glibc version, the extensions,
             # and runs a DBGp smoke test.
+            -   name: Download the libraries
+                uses: actions/download-artifact@v6
+                with:
+                    name: staticphp-libs-${{ matrix.arch.arch }}
+                    path: ${{ runner.temp }}
+
             -   name: Build PHP with static php_debugger
                 env:
                     PHP_URL: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].url }}
@@ -518,8 +570,9 @@ jobs:
                     GITHUB_TOKEN: ${{ github.token }}
                 run: |
                     mkdir -p dist
-                    sh .github/scripts/build-linux-interpreter.sh "$PHP_URL" "$PHP_SHA256" "${{ matrix.ts }}" . \
-                      "dist/php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}"
+                    sh .github/scripts/build-linux-interpreter.sh php "$PHP_URL" "$PHP_SHA256" "${{ matrix.ts }}" . \
+                      "dist/php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}" \
+                      "$RUNNER_TEMP/staticphp-libs.tar.gz"
 
             # GitHub's runners have recent CPUs; run on the oldest CPU model of the
             # architecture too, so instructions older CPUs lack fail here instead of
