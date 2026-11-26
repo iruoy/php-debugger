@@ -557,7 +557,7 @@ jobs:
             # also checks the linked libraries, the glibc version, the extensions,
             # and runs a DBGp smoke test.
             -   name: Download the libraries
-                uses: actions/download-artifact@v6
+                uses: actions/download-artifact@v8
                 with:
                     name: staticphp-libs-${{ matrix.arch.arch }}
                     path: ${{ runner.temp }}
@@ -624,7 +624,7 @@ jobs:
             # artifact named release--*. Other artifacts in the run, such as
             # php-windows-builder's own uploads, are left out.
             -   name: Download release assets
-                uses: actions/download-artifact@v6
+                uses: actions/download-artifact@v8
                 with:
                     pattern: release--*
                     merge-multiple: true
