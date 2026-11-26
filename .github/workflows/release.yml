@@ -235,12 +235,14 @@ jobs:
             # GitHub's runners have recent CPUs; run on the oldest CPU model of the
             # architecture too, so instructions older CPUs lack fail here instead of
             # on users' machines. (The musl build uses the same compiler settings.)
+            # In Debian 12, see the script for why not on the runner itself.
             -   name: Check it runs on a baseline CPU
                 if: matrix.libc == 'glibc'
                 run: |
-                    sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user >/dev/null
-                    B="$RUNNER_TEMP/php-debugger-build"
-                    sh .github/scripts/check-baseline-cpu.sh "$B/php/bin/php" . -d "zend_extension=$B/ext/modules/php_debugger.so"
+                    docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/php-debugger-build:/b:ro" debian:12-slim sh -euc '
+                        apt-get -qq update && apt-get -qq install -y qemu-user >/dev/null
+                        sh /src/.github/scripts/check-baseline-cpu.sh /b/php/bin/php /src -d zend_extension=/b/ext/modules/php_debugger.so
+                    '
 
             # The runner cannot run a musl PHP, so test in the official Alpine image
             # of the same version and thread safety. There is none for NTS 8.6: from
@@ -501,7 +503,7 @@ jobs:
                     ref: ${{ env.RELEASE_REF }}
 
             -   name: Install build dependencies
-                run: sudo apt-get update -qq && sudo apt-get install -y -qq re2c gettext qemu-user
+                run: sudo apt-get update -qq && sudo apt-get install -y -qq re2c gettext
 
             # Built with StaticPHP: every library linked in except glibc, which its
             # zig toolchain targets at MAX_GLIBC, so it runs on any distro with that
@@ -521,9 +523,13 @@ jobs:
 
             # GitHub's runners have recent CPUs; run on the oldest CPU model of the
             # architecture too, so instructions older CPUs lack fail here instead of
-            # on users' machines
+            # on users' machines. In Debian 12, see the script for why not on the runner.
             -   name: Check it runs on a baseline CPU
-                run: sh .github/scripts/check-baseline-cpu.sh "dist/php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}" .
+                run: |
+                    docker run --rm -v "$PWD:/src:ro" debian:12-slim sh -euc '
+                        apt-get -qq update && apt-get -qq install -y qemu-user >/dev/null
+                        sh /src/.github/scripts/check-baseline-cpu.sh "/src/dist/$0" /src
+                    ' "php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}"
 
             -   name: Check it runs on other distros
                 run: |
