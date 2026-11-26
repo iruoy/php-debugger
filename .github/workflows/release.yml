@@ -742,15 +742,18 @@ jobs:
             -   name: List release assets
                 run: ls -la release-assets/
 
+            # With GitHub's own CLI. RELEASE_REF is the tag on both a push and a
+            # workflow_dispatch (where GITHUB_REF is the branch picked in the UI).
             -   name: Create release
-                uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
-                with:
-                    # on a `push` trigger this is inferred from GITHUB_REF; on
-                    # workflow_dispatch GITHUB_REF is the branch picked in the
-                    # UI, not the tag, so it must be set explicitly here too
-                    tag_name: ${{ env.RELEASE_REF }}
-                    generate_release_notes: true
-                    files: release-assets/*
+                env:
+                    GH_TOKEN: ${{ github.token }}
+                run: |
+                    if gh release view "$RELEASE_REF" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                        # A rerun finds the release already there: replace its assets
+                        gh release upload "$RELEASE_REF" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+                    else
+                        gh release create "$RELEASE_REF" release-assets/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+                    fi
 
             -   name: Trigger Docker image build
                 # This step's own release-publish above used GITHUB_TOKEN, and GitHub
