@@ -94,13 +94,20 @@ if [ "$MODE" = libs-prepare ]; then
         echo "libraries $LIBRARIES"
         python3 -c '
 import json, sys
-cache = json.load(open(sys.argv[1]))
-for name in sorted(cache):
-    for kind, entry in sorted(cache[name].items()):
-        entries = entry.values() if kind == "binary" else [entry]
-        for e in entries:
-            if e:
-                print(name, kind, e.get("version"), e.get("hash"))
+
+# Every download StaticPHP recorded: an object with a "hash", at any depth
+def downloads(path, node):
+    if isinstance(node, dict):
+        if "hash" in node:
+            yield "/".join(path), node.get("version"), node.get("hash")
+        for key in sorted(node):
+            yield from downloads(path + [str(key)], node[key])
+    elif isinstance(node, list):
+        for i, item in enumerate(node):
+            yield from downloads(path + [str(i)], item)
+
+for entry in downloads([], json.load(open(sys.argv[1]))):
+    print(*entry)
 ' "$WORK/downloads/.cache.json"
     } > "$KEY_FILE"
     cat "$KEY_FILE"
