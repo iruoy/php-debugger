@@ -16,6 +16,14 @@ on:
             tag:
                 description: 'Tag to build and release (e.g. 0.3.0)'
                 required: true
+    # Pull requests that change the release build run all build jobs (with a
+    # placeholder version, see RELEASE_VERSION) but publish nothing, so such a
+    # change is tested on every platform before it reaches a release.
+    pull_request:
+        paths:
+            - '.github/workflows/release.yml'
+            - '.github/scripts/**'
+            - 'config.w32'
 
 # Least-privilege default: build/validate jobs only ever check out code and
 # upload/download workflow artifacts, none of which needs write access.
@@ -31,7 +39,8 @@ permissions:
 # and softprops/action-gh-release racing to create the same release.
 concurrency:
     group: release-${{ github.event.inputs.tag || github.ref_name }}
-    cancel-in-progress: false
+    # A newer push to a pull request supersedes its older test build
+    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
     # The tag to build: the pushed tag on a `push` trigger, or the input on a
@@ -39,7 +48,12 @@ env:
     # final release-creation step key off this instead of the default ref, so
     # a workflow_dispatch run (which otherwise checks out the branch selected
     # in the UI, not the tag) still builds and releases the right commit.
-    RELEASE_REF: ${{ github.event.inputs.tag || github.ref_name }}
+    # On a pull request: the pull request's merge commit.
+    RELEASE_REF: ${{ github.event_name == 'pull_request' && github.sha || github.event.inputs.tag || github.ref_name }}
+
+    # The version in the asset names (PIE requires it to match the tag): the tag,
+    # or a placeholder on a pull request.
+    RELEASE_VERSION: ${{ github.event_name == 'pull_request' && format('0.0.0-pr{0}', github.event.number) || github.event.inputs.tag || github.ref_name }}
 
     # The oldest glibc the Linux binaries (extensions and interpreters) run on:
     # they are built with zig for this glibc version, whatever glibc the runner
@@ -74,6 +88,7 @@ jobs:
             php-sources: ${{ steps.resolve.outputs.php-sources }}
         steps:
             -   name: Validate tag
+                if: github.event_name != 'pull_request'
                 env:
                     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                 run: |
@@ -147,7 +162,7 @@ jobs:
                     # PIE asset: an exactly named zip with php_debugger.so at its root
                     # (see "download-url-method" in composer.json); PIE calls the macOS
                     # libc bsdlibc
-                    zip -j "dist/php_php_debugger-${RELEASE_REF}_php${PHP_VER}-arm64-darwin-bsdlibc-${{ matrix.ts == 'ts' && 'zts' || 'nts' }}.zip" modules/php_debugger.so
+                    zip -j "dist/php_php_debugger-${RELEASE_VERSION}_php${PHP_VER}-arm64-darwin-bsdlibc-${{ matrix.ts == 'ts' && 'zts' || 'nts' }}.zip" modules/php_debugger.so
 
             -   name: Upload artifact
                 uses: actions/upload-artifact@v7
@@ -248,7 +263,7 @@ jobs:
                     mkdir dist
                     # PIE asset: an exactly named zip with php_debugger.so at its root
                     # (see "download-url-method" in composer.json)
-                    zip -j "dist/php_php_debugger-${RELEASE_REF}_php${PHP_VER}-${ARCH_TAG}-linux-${LIBC}-${{ matrix.ts == 'ts' && 'zts' || 'nts' }}.zip" "$RUNNER_TEMP/out/php_debugger.so"
+                    zip -j "dist/php_php_debugger-${RELEASE_VERSION}_php${PHP_VER}-${ARCH_TAG}-linux-${LIBC}-${{ matrix.ts == 'ts' && 'zts' || 'nts' }}.zip" "$RUNNER_TEMP/out/php_debugger.so"
                     # The plain .so is for glibc only: php-debugger/installer matches
                     # assets on the tokens in their names and cannot tell libcs apart,
                     # so it could pick a musl .so on a glibc system
@@ -290,7 +305,7 @@ jobs:
                     run-tests: false
                     # Version in the builder's zip name; it defaults to the ref
                     # name, which on a workflow_dispatch run is the branch
-                    extension-ref: ${{ env.RELEASE_REF }}
+                    extension-ref: ${{ env.RELEASE_VERSION }}
 
             -   name: Package artifact
                 shell: pwsh
@@ -299,7 +314,7 @@ jobs:
                     # same name in artifacts\logs\), already named and laid out the way
                     # PIE expects: php_{ext}-{version}-{php}-{ts}-{compiler}-{arch}.zip
                     # with a DLL of the same base name. It is the PIE asset as is.
-                    $found = @(Get-Item "artifacts\php_php_debugger-$($env:RELEASE_REF)-${{ matrix.php-version }}-${{ matrix.ts }}-*-x86_64.zip")
+                    $found = @(Get-Item "artifacts\php_php_debugger-$($env:RELEASE_VERSION)-${{ matrix.php-version }}-${{ matrix.ts }}-*-x86_64.zip")
                     if ($found.Count -ne 1) { Write-Error "Expected one builder zip in artifacts\, found $($found.Count)"; exit 1 }
                     $pieZip = $found[0]
                     New-Item -ItemType Directory -Force -Path dist | Out-Null
@@ -559,19 +574,190 @@ jobs:
                     name: release--php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}
                     path: dist/
 
-    # Lives in its own reusable workflow so pull requests that change it are
-    # built and tested on Windows runners without cutting a release.
+    # Builds the self-contained Windows PHP interpreter with php_debugger compiled in
+    # statically, packaged as a zip in the same layout as the windows.php.net
+    # downloads (php.exe, php8[ts].dll, the dependency DLLs, ext\, php.ini-*).
+    #
+    # A zip, not a bare php.exe: on Windows php.exe is only a launcher, and PHP
+    # itself (including the statically built debugger) lives in php8.dll /
+    # php8ts.dll, which in turn needs the dependency DLLs (libcrypto, libssh2, ...).
+    #
+    # The build reuses php/php-windows-builder's BuildPhp module, which is what the
+    # official windows.php.net builds use. That gives the official dependency set,
+    # the toolset matching the official builds (VS16 for 8.2/8.3, VS17 for 8.4/8.5,
+    # VS18 for 8.6, so users' existing extension DLLs keep loading), and the official
+    # configure flags, including a real NTS build (Windows configure defaults to ZTS). Two
+    # things are changed: php_debugger is added statically with the JIT disabled
+    # (it is incompatible with php-debugger), and PGO is dropped, since its
+    # training run would add a lot of build time for a debugging interpreter.
+    #
     build-php-windows:
         needs: prepare
-        uses: ./.github/workflows/build-php-windows.yml
-        with:
-            # Same value as env.RELEASE_REF, which is not available in with: when
-            # calling a reusable workflow, so the expression is repeated here.
-            ref: ${{ github.event.inputs.tag || github.ref_name }}
-            php-sources: ${{ needs.prepare.outputs.php-sources }}
+        strategy:
+            fail-fast: false
+            matrix:
+                php-version: ${{ fromJSON(needs.prepare.outputs.php-versions) }}
+                ts:
+                    - nts
+                    - ts
+        # VS 2026 (needed for PHP 8.6 and later) is only on the windows-2025-vs2026 image
+        runs-on: ${{ contains(fromJSON('["8.2", "8.3", "8.4", "8.5"]'), matrix.php-version) && 'windows-2022' || 'windows-2025-vs2026' }}
+        name: "PHP Binary Windows — PHP ${{ matrix.php-version }} — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
+        steps:
+            -   name: Checkout extension
+                uses: actions/checkout@v7
+                with:
+                    ref: ${{ env.RELEASE_REF }}
+                    path: ext-src
+
+            -   name: Checkout php-windows-builder
+                uses: actions/checkout@v7
+                with:
+                    repository: php/php-windows-builder
+                    # v1 (1.10.0), pinned: the steps below patch files inside it. Needs
+                    # 1.10.0 or later for the VS 2026 toolset and PHP SDK 2.9.0 used by 8.6.
+                    ref: 227d3cb94e4fd9e9ab9459020df2394ee9a00eb4
+                    path: builder
+
+            # Short path: the official build lays deps\ and obj\ next to the source dir.
+            -   name: Fetch PHP source
+                shell: bash
+                env:
+                    PHP_URL: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].url }}
+                    PHP_SHA256: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].sha256 }}
+                run: sh ext-src/.github/scripts/fetch-php-source.sh "$PHP_URL" "$PHP_SHA256" /c/php-build/php-src
+
+            -   name: Add the extension
+                shell: pwsh
+                run: Copy-Item -Path ext-src -Destination C:\php-build\php-src\ext\php_debugger -Recurse
+
+            -   name: Adjust the official build configuration
+                shell: pwsh
+                run: |
+                    $module = "builder\php\BuildPhp"
+                    $ts = "${{ matrix.ts }}"
+
+                    # The toolset the official build uses for this PHP version.
+                    $vs = (Get-Content "$module\config\vs.json" -Raw | ConvertFrom-Json).php."${{ matrix.php-version }}"
+                    if (-not $vs) { Write-Error "php-windows-builder has no toolset for PHP ${{ matrix.php-version }}"; exit 1 }
+                    Write-Host "Toolset for PHP ${{ matrix.php-version }}: $vs"
+
+                    # Official configure flags, minus PGO instrumentation and the
+                    # Oracle extensions (their SDK path is relative to the official
+                    # build tree), plus the debugger compiled in statically and the
+                    # JIT disabled.
+                    $cfg = "$module\config\$vs\x64\config.$ts.bat"
+                    $content = Get-Content $cfg -Raw
+                    # [ \t]* rather than \s*, so removing a flag at the end of a line
+                    # cannot join it with the next one.
+                    $content = $content -replace '"--enable-pgi"[ \t]*', ''
+                    $content = $content -replace '"--with-(pdo-oci|oci8-19)=[^"]*"[ \t]*', ''
+                    # Insert before the trailing %* (the arguments forwarded to configure).
+                    # $ deliberately matches only at the end of the file, not of each line,
+                    # so a %* anywhere else is left alone; the check below fails the job
+                    # if the flags were not inserted exactly once.
+                    $content = $content -replace '%\*(\s*)$', '"--enable-php-debugger" "--disable-opcache-jit" %*$1'
+                    if ($content -match '--enable-pgi|--with-(pdo-oci|oci8-19)' -or
+                        ([regex]::Matches($content, '"--enable-php-debugger"')).Count -ne 1) {
+                        Write-Error "unexpected format of ${cfg}: $content"; exit 1
+                    }
+                    # The upstream .bat files are ASCII; keep them that way for cmd.
+                    Set-Content -Path $cfg -Value $content -NoNewline -Encoding ascii
+                    Write-Host "configure: $content"
+
+                    # Build and package without the PGO training passes.
+                    Set-Content -Path "$module\runner\task-$ts.bat" -Encoding ascii -Value @(
+                        'call buildconf.bat 2>&1'
+                        'if errorlevel 1 exit 1'
+                        "call config.$ts.bat 2>&1"
+                        'if errorlevel 1 exit 2'
+                        'nmake 2>&1'
+                        'if errorlevel 1 exit 3'
+                        'nmake snap 2>&1'
+                        'if errorlevel 1 exit 4'
+                    )
+
+            -   name: Build PHP
+                shell: pwsh
+                working-directory: C:\php-build\php-src
+                env:
+                    GITHUB_TOKEN: ${{ github.token }}
+                run: |
+                    Import-Module "$env:GITHUB_WORKSPACE\builder\php\BuildPhp" -Force
+                    Invoke-PhpBuild -Arch x64 -Ts "${{ matrix.ts }}"
+
+            -   name: Package the interpreter bundle
+                id: package
+                shell: pwsh
+                run: |
+                    $zips = @(Get-ChildItem C:\php-build\php-src\artifacts -Filter 'php-*.zip' |
+                        Where-Object { $_.Name -notmatch '^php-(debug|devel|test)-pack-' -and $_.Name -notmatch '-src\.zip$' })
+                    if ($zips.Count -ne 1) {
+                        Get-ChildItem C:\php-build\php-src\artifacts | Format-Table Name, Length
+                        Write-Error "expected exactly one PHP binary zip, found $($zips.Count)"; exit 1
+                    }
+                    $assetName = "php-php${{ matrix.php-version }}-${{ matrix.ts }}-windows-x64.zip"
+                    Write-Host "Packaging $($zips[0].Name) as $assetName"
+                    Copy-Item $zips[0].FullName -Destination $assetName
+                    Add-Content -Path $env:GITHUB_OUTPUT -Value "asset_name=${assetName}" -Encoding utf8
+
+            -   name: Test the bundle from a clean directory
+                shell: pwsh
+                run: |
+                    # Unpack outside the build tree, so php.exe can only use the DLLs
+                    # shipped in the zip. The old bare-php.exe asset passed CI only
+                    # because its test ran next to php8.dll in the build directory.
+                    $dir = Join-Path $env:RUNNER_TEMP 'php-bundle'
+                    Expand-Archive -Path "${{ steps.package.outputs.asset_name }}" -DestinationPath $dir
+                    $php = Join-Path $dir 'php.exe'
+                    if (-not (Test-Path $php)) { Write-Error "php.exe is not at the root of the bundle"; exit 1 }
+
+                    & $php -n -v
+                    if ($LASTEXITCODE -ne 0) { Write-Error "bundled php.exe failed to start (exit $LASTEXITCODE)"; exit 1 }
+
+                    # Shared extensions (and the dependency DLLs they need, e.g.
+                    # libcrypto for openssl) must load from the bundle as well.
+                    $shared = @('openssl', 'curl', 'mbstring', 'sodium', 'zip', 'fileinfo', 'intl')
+                    $loadArgs = @('-n', '-d', "extension_dir=$dir\ext")
+                    $expected = @()
+                    foreach ($e in $shared) {
+                        if (Test-Path (Join-Path $dir "ext\php_$e.dll")) {
+                            $loadArgs += @('-d', "extension=$e")
+                            $expected += $e
+                        }
+                    }
+                    if ($expected -notcontains 'openssl') { Write-Error "the bundle has no php_openssl.dll"; exit 1 }
+
+                    $wantZts = if ("${{ matrix.ts }}" -eq 'ts') { 'true' } else { 'false' }
+                    $test = Join-Path $env:RUNNER_TEMP 'bundle-test.php'
+                    Set-Content -Path $test -Value @"
+                    <?php
+                    `$fail = [];
+                    foreach (['php_debugger', 'dom', 'simplexml', 'xml', 'libxml', 'zlib', '$($expected -join "', '")'] as `$ext) {
+                        if (!extension_loaded(`$ext)) { `$fail[] = "extension `$ext is not loaded"; }
+                    }
+                    foreach (['xdebug_break', 'xdebug_info', 'php_debugger_info'] as `$fn) {
+                        if (!function_exists(`$fn)) { `$fail[] = "function `$fn is missing"; }
+                    }
+                    if (ini_get('xdebug.client_port') === false) { `$fail[] = 'xdebug.* INI missing'; }
+                    if (ini_get('php_debugger.client_port') === false) { `$fail[] = 'php_debugger.* INI missing'; }
+                    if ((bool) PHP_ZTS !== $wantZts) { `$fail[] = 'PHP_ZTS is ' . var_export((bool) PHP_ZTS, true) . ", expected $wantZts"; }
+                    if (`$fail) { fwrite(STDERR, implode(PHP_EOL, `$fail) . PHP_EOL); exit(1); }
+                    echo 'All bundle checks passed' . PHP_EOL;
+                    "@
+                    & $php @loadArgs $test
+                    if ($LASTEXITCODE -ne 0) { Write-Error "bundle checks failed"; exit 1 }
+
+            -   name: Upload artifact
+                uses: actions/upload-artifact@v7
+                with:
+                    # release.yml publishes artifacts named release--*
+                    name: release--${{ steps.package.outputs.asset_name }}
+                    path: ${{ steps.package.outputs.asset_name }}
 
     release:
         needs: [build-macos, build-linux, build-windows, build-php-macos, build-php-linux, build-php-windows]
+        if: github.event_name != 'pull_request'
         runs-on: ubuntu-latest
         permissions:
             contents: write

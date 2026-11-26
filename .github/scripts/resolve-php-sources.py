@@ -17,7 +17,7 @@ import sys
 import urllib.request
 
 # The PHP versions the release builds for: the one list the release workflow's
-# build matrices and build-php-windows.yml take theirs from. Keep it in line
+# build matrices take theirs from. Keep it in line
 # with the PHP version check in config.m4 and "php" in composer.json.
 PHP_VERSIONS = ["8.2", "8.3", "8.4", "8.5", "8.6"]
 
