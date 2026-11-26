@@ -40,12 +40,17 @@ sh "$EXT_SRC/.github/scripts/fetch-php-source.sh" "$PHP_URL" "$PHP_SHA256" "$WOR
 cd "$WORK/php-src"
 ZTS_FLAG=""
 [ "$TS" = "ts" ] && ZTS_FLAG="--enable-zts"
-# zig ships the newest libc headers for every target and only limits the symbols
-# that link. PHP 8.6 enables epoll_pwait2 (glibc 2.35+) whenever the headers
-# declare it, even when it does not link, so rule it out explicitly; PHP treats
-# it as an optional fast path.
+# Two configure answers are overridden for zig:
+# - epoll_pwait2: zig ships the newest libc headers for every target and only
+#   limits the symbols that link. PHP 8.6 enables epoll_pwait2 (glibc 2.35+)
+#   whenever the headers declare it, even when it does not link; it is an
+#   optional fast path for PHP.
+# - __builtin_cpu_supports/__builtin_cpu_init: with zig's runtime library they
+#   report CPU features the CPU does not have, so PHP picked its AVX2 code on
+#   older x86-64 CPUs and crashed with "Illegal instruction". Without them PHP
+#   detects the CPU itself (cpuid).
 ./configure --quiet --prefix="$WORK/php" --disable-all --disable-cgi --disable-phpdbg --disable-opcache-jit $ZTS_FLAG \
-    ac_cv_have_decl_epoll_pwait2=no
+    ac_cv_have_decl_epoll_pwait2=no php_cv_have___builtin_cpu_supports=no php_cv_have___builtin_cpu_init=no
 make -s -j"$(nproc)" >/dev/null
 make -s install >/dev/null
 
