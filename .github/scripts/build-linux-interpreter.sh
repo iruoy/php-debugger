@@ -68,11 +68,10 @@ spc doctor --auto-fix
 spc download php-src --custom-local="php-src:$PHP_SRC"
 
 # StaticPHP's default configure command (config/env.ini, [linux]) plus the
-# debugger and the mhash functions, which StaticPHP has no option for, and two
-# configure answers overridden for zig (see build-linux-binary.sh): no
-# epoll_pwait2 (glibc 2.35+, declared by zig's newer headers), and no
-# __builtin_cpu_supports/__builtin_cpu_init, which report CPU features the CPU
-# does not have with zig's runtime library. PHP 8.6 bundles Libtool 2.5, which rejects --with-pic in favour of
+# debugger and the mhash functions, which StaticPHP has no option for. zig ships
+# the newest glibc headers and only limits the symbols that link; PHP 8.6
+# enables epoll_pwait2 (glibc 2.35+) whenever the headers declare it, so rule
+# it out (an optional fast path for PHP). PHP 8.6 bundles Libtool 2.5, which rejects --with-pic in favour of
 # --enable-pic; 8.2-8.5 bundle Libtool 1.5, which only knows --with-pic.
 case "$(grep -o 'PHP_VERSION "[0-9]*\.[0-9]*' "$PHP_SRC/main/php_version.h" | cut -d'"' -f2)" in
     8.[2-5]) PIC_FLAG=--with-pic ;;
@@ -80,7 +79,7 @@ case "$(grep -o 'PHP_VERSION "[0-9]*\.[0-9]*' "$PHP_SRC/main/php_version.h" | cu
 esac
 ZTS_ARG=""
 [ "$TS" = "ts" ] && ZTS_ARG="--enable-zts"
-SPC_CMD_PREFIX_PHP_CONFIGURE="./configure --prefix= --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-rtld-now --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger ac_cv_have_decl_epoll_pwait2=no php_cv_have___builtin_cpu_supports=no php_cv_have___builtin_cpu_init=no" \
+SPC_CMD_PREFIX_PHP_CONFIGURE="./configure --prefix= --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-rtld-now --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger ac_cv_have_decl_epoll_pwait2=no" \
     spc build:php-cli "$EXTENSIONS" $ZTS_ARG \
         --disable-opcache-jit \
         --with-config-file-path=/usr/local/etc/php \
