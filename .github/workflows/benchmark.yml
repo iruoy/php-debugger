@@ -215,10 +215,17 @@ jobs:
         # Clean up intermediary artifacts after both performance jobs complete
         needs: performance
         runs-on: ubuntu-latest
+        permissions:
+            actions: write
         steps:
             -   name: delete intermediary artifacts
                 # The intermediate files that we generated are not needed and can be deleted,
                 # helping us keep the summary page clean
-                uses: geekyeggo/delete-artifact@176a747ab7e287e3ff4787bf8a148716375ca118 # v6.0.0
-                with:
-                    name: results-*
+                env:
+                    GH_TOKEN: ${{ github.token }}
+                run: |
+                    gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+                        --jq '.artifacts[] | select(.name | startswith("results-")) | .id' \
+                    | while read -r id; do
+                        gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+                    done
