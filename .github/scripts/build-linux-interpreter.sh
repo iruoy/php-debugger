@@ -32,12 +32,15 @@ WORK=/tmp/staticphp
 mkdir -p "$WORK"
 cd "$WORK"
 
-# PHP source: the php.net tarball, with the debugger added as a bundled extension
-sh "$EXT_SRC/.github/scripts/fetch-php-source.sh" "$PHP_URL" "$PHP_SHA256" "$WORK/php-src"
-cp -r "$EXT_SRC" "$WORK/php-src/ext/php_debugger"
-rm -rf "$WORK/php-src/ext/php_debugger/.git"
-mkdir -p "$WORK/php-src/m4"
-cp "$EXT_SRC"/m4/*.m4 "$WORK/php-src/m4/"
+# PHP source: the php.net tarball, with the debugger added as a bundled extension.
+# It goes where StaticPHP keeps the PHP source (source/php-src): for a local
+# source it skips extraction and builds from that directory.
+PHP_SRC="$WORK/source/php-src"
+sh "$EXT_SRC/.github/scripts/fetch-php-source.sh" "$PHP_URL" "$PHP_SHA256" "$PHP_SRC"
+cp -r "$EXT_SRC" "$PHP_SRC/ext/php_debugger"
+rm -rf "$PHP_SRC/ext/php_debugger/.git"
+mkdir -p "$PHP_SRC/m4"
+cp "$EXT_SRC"/m4/*.m4 "$PHP_SRC/m4/"
 
 # Link against glibc instead of musl, targeting the oldest version supported.
 # With a target set, StaticPHP builds with its zig toolchain.
@@ -45,12 +48,12 @@ export SPC_TARGET="native-native-gnu.${MAX_GLIBC}"
 
 spc doctor --auto-fix
 # Registers the PHP source; the build downloads the libraries and toolchain it needs
-spc download php-src --custom-local="php-src:$WORK/php-src"
+spc download php-src --custom-local="php-src:$PHP_SRC"
 
 # StaticPHP's default configure command (config/env.ini, [linux]) plus the
 # debugger and the mhash functions, which StaticPHP has no option for. PHP 8.6 bundles Libtool 2.5, which rejects --with-pic in favour of
 # --enable-pic; 8.2-8.5 bundle Libtool 1.5, which only knows --with-pic.
-case "$(grep -o 'PHP_VERSION "[0-9]*\.[0-9]*' "$WORK/php-src/main/php_version.h" | cut -d'"' -f2)" in
+case "$(grep -o 'PHP_VERSION "[0-9]*\.[0-9]*' "$PHP_SRC/main/php_version.h" | cut -d'"' -f2)" in
     8.[2-5]) PIC_FLAG=--with-pic ;;
     *) PIC_FLAG=--enable-pic ;;
 esac
