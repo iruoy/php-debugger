@@ -488,11 +488,30 @@ jobs:
             -   name: Install build dependencies
                 run: sudo apt-get update -qq && sudo apt-get install -y -qq re2c gettext
 
-            -   name: Build the libraries
+            # Downloads the library sources and writes what decides the build
+            # (StaticPHP's commit, the target, each library's version and hash)
+            # to staticphp-libs.key, the cache key below
+            -   name: Resolve the libraries
                 env:
                     # StaticPHP looks up its library sources through the GitHub API
                     GITHUB_TOKEN: ${{ github.token }}
-                run: sh .github/scripts/build-linux-interpreter.sh libs "$RUNNER_TEMP/staticphp-libs.tar.gz"
+                run: sh .github/scripts/build-linux-interpreter.sh libs-prepare staticphp-libs.key
+
+            # A new release of any library changes the key, so the cache never
+            # serves outdated libraries. Caches are scoped to the branch that wrote
+            # them: a pull request run can read main's but not write to it.
+            -   name: Cache the libraries
+                id: cache
+                uses: actions/cache@v6
+                with:
+                    path: ${{ runner.temp }}/staticphp-libs.tar.gz
+                    key: staticphp-libs-${{ matrix.arch.arch }}-${{ hashFiles('staticphp-libs.key') }}
+
+            -   name: Build the libraries
+                if: steps.cache.outputs.cache-hit != 'true'
+                env:
+                    GITHUB_TOKEN: ${{ github.token }}
+                run: sh .github/scripts/build-linux-interpreter.sh libs-build "$RUNNER_TEMP/staticphp-libs.tar.gz"
 
             -   name: Upload libraries
                 uses: actions/upload-artifact@v7

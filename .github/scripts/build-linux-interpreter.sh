@@ -8,10 +8,17 @@
 # It can still load shared extensions, which php-debugger/installer relies on
 # when it keeps a replaced PHP's extensions.
 #
-# Two steps, so the libraries are built once per architecture instead of once
-# per PHP version and thread-safety mode (they depend on neither):
-#   libs <output archive>
-#       builds the libraries (and fetches StaticPHP's zig toolchain) and packs
+# The libraries are built once per architecture instead of once per PHP version
+# and thread-safety mode (they depend on neither), and cached between runs:
+#   libs-prepare <key file>
+#       sets up StaticPHP and its zig toolchain and downloads the library
+#       sources (StaticPHP picks the latest release of each), then writes what
+#       decides the build into the key file: StaticPHP's commit, the target,
+#       the libraries and each download's version and hash. The workflow caches
+#       the built libraries under a hash of this file, so a new library release
+#       means a new build.
+#   libs-build <output archive>
+#       (after libs-prepare, on a cache miss) builds the libraries and packs
 #       StaticPHP's buildroot/, pkgroot/ (zig) and downloads/ into an archive
 #   php <php tarball url> <sha256> <nts|ts> <extension source dir> <output file> [libs archive]
 #       builds the interpreter; with the archive from "libs", StaticPHP finds
@@ -63,17 +70,41 @@ setup_staticphp() {
     spc --version
 }
 
-if [ "$MODE" = libs ]; then
-    OUT="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+if [ "$MODE" = libs-prepare ]; then
+    KEY_FILE="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
     setup_staticphp
     spc doctor --auto-fix
+    spc download --for-packages="$LIBRARIES"
+    {
+        echo "staticphp $STATICPHP_COMMIT"
+        echo "target $SPC_TARGET"
+        echo "libraries $LIBRARIES"
+        python3 -c '
+import json, sys
+cache = json.load(open(sys.argv[1]))
+for name in sorted(cache):
+    for kind, entry in sorted(cache[name].items()):
+        entries = entry.values() if kind == "binary" else [entry]
+        for e in entries:
+            if e:
+                print(name, kind, e.get("version"), e.get("hash"))
+' "$WORK/downloads/.cache.json"
+    } > "$KEY_FILE"
+    cat "$KEY_FILE"
+    exit 0
+fi
+
+if [ "$MODE" = libs-build ]; then
+    OUT="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+    cd "$WORK"
+    export PATH="$WORK/bin:$PATH"
     spc build:libs "$LIBRARIES" || { tail -n 60 "$WORK/log/spc.shell.log" >&2; exit 1; }
     tar -czf "$OUT" -C "$WORK" buildroot pkgroot downloads
     ls -la "$OUT"
     exit 0
 fi
 
-[ "$MODE" = php ] || { echo "usage: $0 libs <archive> | php <url> <sha256> <nts|ts> <extension source dir> <output file> [libs archive]" >&2; exit 2; }
+[ "$MODE" = php ] || { echo "usage: $0 libs-prepare <key file> | libs-build <archive> | php <url> <sha256> <nts|ts> <extension source dir> <output file> [libs archive]" >&2; exit 2; }
 
 PHP_URL="$1"
 PHP_SHA256="$2"
