@@ -6,11 +6,11 @@
 # every other check and only crashes, with "Illegal instruction", on users'
 # older machines. Here it crashes in CI instead.
 #
-# Run it in a Debian 12 container, not on the runner itself: the binary uses the
+# Run it in a Debian 13 container, not on the runner itself: the binary uses the
 # system's dynamic loader and glibc, and the ubuntu-26.04 runner's are built
-# for AVX-capable CPUs, so even a baseline binary crashes there. Debian 12's
-# are built for baseline x86-64, and its glibc (2.36) is new enough for our
-# binaries.
+# for AVX-capable CPUs, so even a baseline binary crashes there. Debian 13's
+# are built for baseline x86-64. (Its glibc, 2.41, is newer than the binaries
+# need; the oldest glibc is checked separately, on AlmaLinux 9.)
 #
 # Usage: check-baseline-cpu.sh <php binary> <extension source dir> [php options, e.g. -d zend_extension=...]
 set -eu

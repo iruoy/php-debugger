@@ -235,11 +235,11 @@ jobs:
             # GitHub's runners have recent CPUs; run on the oldest CPU model of the
             # architecture too, so instructions older CPUs lack fail here instead of
             # on users' machines. (The musl build uses the same compiler settings.)
-            # In Debian 12, see the script for why not on the runner itself.
+            # In Debian 13, see the script for why not on the runner itself.
             -   name: Check it runs on a baseline CPU
                 if: matrix.libc == 'glibc'
                 run: |
-                    docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/php-debugger-build:/b:ro" debian:12-slim sh -euc '
+                    docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/php-debugger-build:/b:ro" debian:13-slim sh -euc '
                         apt-get -qq update && apt-get -qq install -y qemu-user >/dev/null
                         sh /src/.github/scripts/check-baseline-cpu.sh /b/php/bin/php /src -d zend_extension=/b/ext/modules/php_debugger.so
                     '
@@ -523,10 +523,10 @@ jobs:
 
             # GitHub's runners have recent CPUs; run on the oldest CPU model of the
             # architecture too, so instructions older CPUs lack fail here instead of
-            # on users' machines. In Debian 12, see the script for why not on the runner.
+            # on users' machines. In Debian 13, see the script for why not on the runner.
             -   name: Check it runs on a baseline CPU
                 run: |
-                    docker run --rm -v "$PWD:/src:ro" debian:12-slim sh -euc '
+                    docker run --rm -v "$PWD:/src:ro" debian:13-slim sh -euc '
                         apt-get -qq update && apt-get -qq install -y qemu-user >/dev/null
                         sh /src/.github/scripts/check-baseline-cpu.sh "/src/dist/$0" /src
                     ' "php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}"
