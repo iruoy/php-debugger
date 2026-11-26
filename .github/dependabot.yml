@@ -5,18 +5,3 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
-
-  # Linux release build images: digest updates only, since a newer base
-  # version raises the oldest libc the binaries run on (see the Dockerfiles)
-  - package-ecosystem: "docker"
-    directories:
-      - "/.github/builders/glibc"
-      - "/.github/builders/interpreter"
-      - "/.github/builders/musl"
-    schedule:
-      interval: "monthly"
-    ignore:
-      - dependency-name: "almalinux"
-        update-types: ["version-update:semver-major", "version-update:semver-minor"]
-      - dependency-name: "alpine"
-        update-types: ["version-update:semver-major", "version-update:semver-minor"]

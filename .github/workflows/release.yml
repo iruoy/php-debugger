@@ -41,6 +41,12 @@ env:
     # in the UI, not the tag) still builds and releases the right commit.
     RELEASE_REF: ${{ github.event.inputs.tag || github.ref_name }}
 
+    # The oldest glibc the Linux binaries (extensions and interpreters) run on:
+    # they are built with zig for this glibc version, whatever glibc the runner
+    # has. 2.34 is the oldest in supported distros used for development (RHEL 9;
+    # Debian 12 and Ubuntu 22.04 are newer). The build fails if a binary needs more.
+    MAX_GLIBC: '2.34'
+
     # Configure flags for the macOS interpreter build (JIT disabled - incompatible with
     # php-debugger). The PIC flag is not here: its spelling depends on the PHP version,
     # see PIC_FLAG in the build step. The Linux interpreter is built with StaticPHP,
@@ -190,9 +196,9 @@ jobs:
                     - nts
                     - ts
                 arch:
-                    - runner: ubuntu-latest
+                    - runner: ubuntu-26.04
                       arch: x86_64
-                    - runner: ubuntu-24.04-arm
+                    - runner: ubuntu-26.04-arm
                       arch: arm64
                 libc:
                     - glibc
@@ -204,19 +210,44 @@ jobs:
                 with:
                     ref: ${{ env.RELEASE_REF }}
 
-            # Built in the images in .github/builders/ rather than on the runner,
-            # to pin the oldest libc the binaries need; see the Dockerfiles
-            -   name: Build and test extension
+            # Built with zig for the target libc (glibc MAX_GLIBC or musl), so the
+            # binary does not depend on the runner's glibc; see the build script,
+            # which also runs the glibc build's load check and DBGp smoke test
+            -   name: Build extension
                 env:
                     PHP_URL: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].url }}
                     PHP_SHA256: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].sha256 }}
+                    TARGET: ${{ matrix.arch.arch == 'arm64' && 'aarch64' || 'x86_64' }}-linux-${{ matrix.libc == 'glibc' && format('gnu.{0}', env.MAX_GLIBC) || 'musl' }}
+                run: sh .github/scripts/build-linux-binary.sh "$PHP_URL" "$PHP_SHA256" "${{ matrix.ts }}" "$TARGET" . "$RUNNER_TEMP/out"
+
+            # The build machine has a newer glibc than the target, so check where it
+            # matters: the PHP built alongside (for the same glibc) loads the
+            # extension on the oldest supported glibc
+            -   name: Check it loads on older distros
+                if: matrix.libc == 'glibc'
                 run: |
-                    docker build -q -t php-debugger-builder ".github/builders/${{ matrix.libc }}"
-                    docker run --rm \
-                      -v "$PWD:/ext:ro" \
-                      -v "$RUNNER_TEMP/out:/out" \
-                      php-debugger-builder \
-                      sh /ext/.github/scripts/build-linux-binary.sh "$PHP_URL" "$PHP_SHA256" "${{ matrix.ts }}" /ext /out
+                    for image in almalinux:9 debian:12-slim ubuntu:22.04; do
+                        echo "== ${image}"
+                        docker run --rm -v "$RUNNER_TEMP/php-debugger-build:/b:ro" "$image" \
+                          /b/php/bin/php -n -d zend_extension=/b/ext/modules/php_debugger.so -r 'exit(extension_loaded("php_debugger") ? 0 : 1);'
+                    done
+
+            # The runner cannot run a musl PHP, so test in the official Alpine image
+            # of the same version and thread safety. There is none for NTS 8.6: from
+            # 8.6 on the official images are ZTS only.
+            -   name: Test in Alpine
+                if: matrix.libc == 'musl' && (matrix.ts == 'ts' || matrix.php-version != '8.6')
+                run: |
+                    if [ "${{ matrix.ts }}" = nts ]; then IMAGE="php:${{ matrix.php-version }}-cli-alpine"
+                    elif [ "${{ matrix.php-version }}" = 8.6 ]; then IMAGE="php:8.6-cli-alpine"
+                    else IMAGE="php:${{ matrix.php-version }}-zts-alpine"; fi
+                    docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/out:/out:ro" "$IMAGE" sh -euc '
+                        cp -r /src /tmp/src && cd /tmp/src
+                        PHP=$(command -v php)
+                        "$PHP" -n -d zend_extension=/out/php_debugger.so -v
+                        TEST_PHP_EXECUTABLE="$PHP" TEST_PHP_ARGS="-n -d zend_extension=/out/php_debugger.so" \
+                          "$PHP" -n run-xdebug-tests.php -q tests/debugger/bug00530.phpt
+                    '
 
             -   name: Package artifact
                 run: |
@@ -447,9 +478,9 @@ jobs:
                     - nts
                     - ts
                 arch:
-                    - runner: ubuntu-latest
+                    - runner: ubuntu-26.04
                       arch: x86_64
-                    - runner: ubuntu-24.04-arm
+                    - runner: ubuntu-26.04-arm
                       arch: arm64
         runs-on: ${{ matrix.arch.runner }}
         name: "PHP Binary Linux — PHP ${{ matrix.php-version }} — ${{ matrix.arch.arch }} — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
@@ -459,9 +490,12 @@ jobs:
                 with:
                     ref: ${{ env.RELEASE_REF }}
 
-            # Built with StaticPHP in the image in .github/builders/interpreter:
-            # every library linked in except glibc, so it runs on any distro with
-            # glibc 2.34+ and can still load shared extensions. The build script
+            -   name: Install build dependencies
+                run: sudo apt-get install -y re2c gettext
+
+            # Built with StaticPHP: every library linked in except glibc, which its
+            # zig toolchain targets at MAX_GLIBC, so it runs on any distro with that
+            # glibc or newer and can still load shared extensions. The build script
             # also checks the linked libraries, the glibc version, the extensions,
             # and runs a DBGp smoke test.
             -   name: Build PHP with static php_debugger
@@ -471,18 +505,13 @@ jobs:
                     # StaticPHP looks up its library sources through the GitHub API
                     GITHUB_TOKEN: ${{ github.token }}
                 run: |
-                    docker build -q -t php-debugger-interpreter-builder .github/builders/interpreter
                     mkdir -p dist
-                    docker run --rm -e GITHUB_TOKEN \
-                      -v "$PWD:/ext:ro" \
-                      -v "$PWD/dist:/out" \
-                      php-debugger-interpreter-builder \
-                      sh /ext/.github/scripts/build-linux-interpreter.sh "$PHP_URL" "$PHP_SHA256" "${{ matrix.ts }}" /ext \
-                        "/out/php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}"
+                    sh .github/scripts/build-linux-interpreter.sh "$PHP_URL" "$PHP_SHA256" "${{ matrix.ts }}" . \
+                      "dist/php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}"
 
             -   name: Check it runs on other distros
                 run: |
-                    for image in debian:12-slim ubuntu:22.04 ubuntu:26.04; do
+                    for image in almalinux:9 debian:12-slim ubuntu:22.04 ubuntu:26.04; do
                         echo "== ${image}"
                         docker run --rm -v "$PWD/dist:/dist:ro" "$image" \
                           /dist/php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }} -n -v
