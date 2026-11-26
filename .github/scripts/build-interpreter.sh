@@ -23,12 +23,12 @@
 #       means a new build.
 #   libs-build <output archive>
 #       (after libs-prepare, on a cache miss) builds the libraries and packs
-#       StaticPHP's buildroot/, pkgroot/ (zig) and downloads/ into an archive
+#       them into an archive, with StaticPHP itself (set up, with its zig)
 #   php <php tarball url> <sha256> <nts|ts> <extension source dir> <output file> [libs archive]
-#       builds the interpreter; with the archive from "libs", StaticPHP finds
-#       those libraries already built and only builds PHP (anything missing from
-#       the archive it still builds itself)
-# (the tarball as resolved by resolve-php-sources.py)
+#       builds the interpreter from the tarball and its sha256 (as resolved by
+#       resolve-php-sources.py); with the archive from libs-build, StaticPHP is
+#       already set up and finds the libraries built, so it only builds PHP
+#       (anything missing from the archive it still builds itself)
 #
 # Needs GITHUB_TOKEN (StaticPHP looks up its library sources through the GitHub
 # API) and MAX_GLIBC (Linux) or MIN_MACOS (macOS) in the environment, PHP 8.4+
@@ -40,8 +40,8 @@ shift
 
 # The extensions the interpreter is built with; php_debugger is added below
 EXTENSIONS="ctype,curl,dom,fileinfo,filter,iconv,mbstring,mysqlnd,opcache,openssl,password-argon2,pdo,pdo_sqlite,phar,posix,readline,session,simplexml,sodium,sqlite3,tokenizer,xml,xmlreader,xmlwriter,zlib"
-# The libraries those extensions need, built by the "libs" step. Keep in sync:
-# a library missing here is still built by every "php" step, just not shared.
+# The libraries those extensions need, built by libs-build. Keep in sync: a
+# library missing here is still built by every php build, just not shared.
 LIBRARIES="zlib,openssl,libiconv,xz,libxml2,libsodium,ncurses,libedit,curl,libargon2,sqlite"
 
 OS=$(uname -s)
@@ -50,7 +50,8 @@ if [ "$OS" = Linux ]; then
     # With a target set, StaticPHP builds with its zig toolchain. The architecture
     # is named explicitly: "native" would also mean the runner's CPU, and zig would
     # use instructions that older CPUs (and Apple Silicon VMs) do not have.
-    export SPC_TARGET="$(uname -m)-linux-gnu.${MAX_GLIBC}"
+    SPC_TARGET="$(uname -m)-linux-gnu.${MAX_GLIBC}"
+    export SPC_TARGET
     TARGET_DESCRIPTION="$SPC_TARGET"
 else
     # StaticPHP's default macOS target (clang for the machine's architecture,
@@ -60,6 +61,11 @@ else
 fi
 
 WORK="${RUNNER_TEMP:-/tmp}/staticphp"
+
+# The absolute path of a file that may not exist yet (the script changes directories)
+abspath() {
+    echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+}
 
 setup_staticphp() {
     rm -rf "$WORK"
@@ -84,7 +90,7 @@ setup_staticphp() {
 }
 
 if [ "$MODE" = libs-prepare ]; then
-    KEY_FILE="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+    KEY_FILE=$(abspath "$1")
     setup_staticphp
     spc doctor --auto-fix
     spc download --for-packages="$LIBRARIES"
@@ -115,11 +121,11 @@ for entry in downloads([], json.load(open(sys.argv[1]))):
 fi
 
 if [ "$MODE" = libs-build ]; then
-    OUT="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+    OUT=$(abspath "$1")
     cd "$WORK"
     export PATH="$WORK/bin:$PATH"
     spc build:libs "$LIBRARIES" || { tail -n 60 "$WORK/log/spc.shell.log" >&2; exit 1; }
-    tar -czf "$OUT" -C "$WORK" buildroot pkgroot downloads
+    tar -czf "$OUT" -C "$WORK" staticphp-src bin buildroot pkgroot downloads
     ls -la "$OUT"
     exit 0
 fi
@@ -130,17 +136,20 @@ PHP_URL="$1"
 PHP_SHA256="$2"
 TS="$3"
 EXT_SRC=$(cd "$4" && pwd)
-# Absolute, since the script changes directories
-OUT="$(cd "$(dirname "$5")" && pwd)/$(basename "$5")"
-LIBS_ARCHIVE=""
-[ $# -ge 6 ] && LIBS_ARCHIVE="$(cd "$(dirname "$6")" && pwd)/$(basename "$6")"
+OUT=$(abspath "$5")
 
-setup_staticphp
 # Before doctor: the archive holds StaticPHP's zig, which doctor would otherwise
 # download and install again (minutes)
-if [ -n "$LIBS_ARCHIVE" ]; then
+if [ $# -ge 6 ]; then
+    LIBS_ARCHIVE=$(abspath "$6")
+    rm -rf "$WORK"
+    mkdir -p "$WORK"
     tar -xzf "$LIBS_ARCHIVE" -C "$WORK"
+    export PATH="$WORK/bin:$PATH"
+else
+    setup_staticphp
 fi
+cd "$WORK"
 spc doctor --auto-fix
 
 # PHP source: the php.net tarball, with the debugger added as a bundled extension.
@@ -156,8 +165,9 @@ cp "$EXT_SRC"/m4/*.m4 "$PHP_SRC/m4/"
 # Registers the PHP source; the build downloads whatever else it still needs
 spc download php-src --custom-local="php-src:$PHP_SRC"
 
-# StaticPHP's default configure command (config/env.ini, [linux]) plus the
-# debugger and the mhash functions, which StaticPHP has no option for. zig ships
+# StaticPHP's default configure command (config/env.ini, [linux], at
+# STATICPHP_COMMIT: compare it when bumping the commit) plus the debugger and
+# the mhash functions, which StaticPHP has no option for. zig ships
 # the newest glibc headers and only limits the symbols that link; PHP 8.6
 # enables epoll_pwait2 (glibc 2.35+) whenever the headers declare it, so rule
 # it out (an optional fast path for PHP). PHP 8.6 bundles Libtool 2.5, which
@@ -172,9 +182,8 @@ esac
 ZTS_ARG=""
 [ "$TS" = "ts" ] && ZTS_ARG="--enable-zts"
 # Where PHP looks for its configuration and, from the prefix, its extensions
-# (php-debugger/installer copies a replaced PHP's extensions there), as the
-# interpreters were built before: PHP's default /usr/local on Linux, and
-# Homebrew's layout on macOS
+# (php-debugger/installer copies a replaced PHP's extensions there): PHP's
+# default /usr/local on Linux, and Homebrew's layout on macOS
 if [ "$OS" = Linux ]; then
     PATHS="--prefix=/usr/local"
     CONFIG_DIR=/usr/local/etc/php
@@ -190,15 +199,13 @@ fi
 #   loads (e.g. pcre2_* in extensions built against an external PCRE2)
 # - macOS: no -dead_strip (StaticPHP's default linker flag), which removes the
 #   PHP API functions PHP itself does not call, so extensions fail to load
-# - PCRE2 under both names: PHP's bundled PCRE2 functions are called
-#   php_pcre2_* (main/php_compat.h), which extensions built against a PHP
-#   with bundled PCRE2 use (the official Docker images, PECL builds). The
-#   distributions' and Homebrew's PHP use the system PCRE2 instead, so their
-#   extensions call the standard pcre2_*_8 names, and on Linux bind them when
-#   they load. Export every bundled function under its standard name too: a
-#   stub that tail-jumps to it, so there is still one PCRE2 and the arguments
-#   pass through untouched. The stubs are appended to ext/pcre/php_pcre.c, so
-#   they are compiled once into PHP itself (zig's linker has no --defsym).
+# - PCRE2 under both names: extensions built against a PHP with bundled PCRE2
+#   (the official Docker images, PECL builds) call php_pcre2_*, those of the
+#   distributions' and Homebrew's PHP (system PCRE2) call pcre2_*_8, and on
+#   Linux bind them when they load. Every bundled function is also exported
+#   under its standard name, see pcre2-aliases.h. The aliases are added to
+#   ext/pcre/php_pcre.c, so they are compiled into PHP itself (zig's linker
+#   has no --defsym).
 if [ "$OS" = Darwin ]; then
     export SPC_DEFAULT_LDFLAGS=""
 fi
@@ -209,27 +216,9 @@ PCRE2_NAMES=$(sed -n 's/^#define[[:space:]]*\(pcre2_[a-z0-9_]*_8\)[[:space:]]*\(
         grep -q "\b${standard%_8}(" "$PHP_SRC/ext/pcre/pcre2lib/pcre2.h" && echo "$bundled $standard"
     done)
 [ -n "$PCRE2_NAMES" ] || { echo "error: no PCRE2 names found in main/php_compat.h" >&2; exit 1; }
+cp "$EXT_SRC/.github/scripts/pcre2-aliases.h" "$PHP_SRC/ext/pcre/php_debugger_pcre2_aliases.h"
 {
-    cat <<'EOF'
-
-#ifdef HAVE_BUNDLED_PCRE
-/* Added by php-debugger's release build (.github/scripts/build-interpreter.sh):
- * every bundled PCRE2 function is also exported under its standard name, for
- * extensions built against a PHP that uses the system PCRE2. Each stub
- * tail-jumps to the bundled function, so the arguments pass through untouched. */
-#if defined(__APPLE__) && defined(__aarch64__)
-#  define PHP_DEBUGGER_PCRE2_ALIAS(standard, bundled) \
-	__asm__(".text\n.globl _" standard "\n.p2align 2\n_" standard ":\n\tb _" bundled "\n");
-#elif defined(__aarch64__)
-#  define PHP_DEBUGGER_PCRE2_ALIAS(standard, bundled) \
-	__asm__(".text\n.globl " standard "\n.type " standard ", %function\n.p2align 2\n" standard ":\n\tb " bundled "\n");
-#elif defined(__x86_64__) && !defined(__APPLE__)
-#  define PHP_DEBUGGER_PCRE2_ALIAS(standard, bundled) \
-	__asm__(".text\n.globl " standard "\n.type " standard ", @function\n" standard ":\n\tjmp " bundled "\n");
-#else
-#  error "no PCRE2 alias stub for this platform"
-#endif
-EOF
+    printf '\n#ifdef HAVE_BUNDLED_PCRE\n#include "php_debugger_pcre2_aliases.h"\n'
     echo "$PCRE2_NAMES" | while read -r bundled standard; do
         echo "PHP_DEBUGGER_PCRE2_ALIAS(\"$standard\", \"$bundled\")"
     done
@@ -249,31 +238,12 @@ SPC_CMD_PREFIX_PHP_CONFIGURE="./configure $PATHS --with-valgrind=no --disable-sh
 PHP="$WORK/buildroot/bin/php"
 file "$PHP"
 
-# Returns whether version $1 is at most version $2
-version_at_most() {
-    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]
-}
-
 if [ "$OS" = Linux ]; then
-    # Only glibc's own libraries may be linked dynamically
-    NEEDED=$(readelf -d "$PHP" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
-    echo "Linked libraries:" $NEEDED
-    for lib in $NEEDED; do
-        case "$lib" in
-            libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|libresolv.so.*|ld-linux*) ;;
-            *) echo "error: the interpreter links $lib dynamically" >&2; exit 1 ;;
-        esac
-    done
-
-    REQUIRED_GLIBC=$(grep -ao 'GLIBC_[0-9][0-9.]*' "$PHP" | sed 's/^GLIBC_//' | sort -uV | tail -1)
-    echo "Requires glibc: $REQUIRED_GLIBC"
-    if ! version_at_most "$REQUIRED_GLIBC" "$MAX_GLIBC"; then
-        echo "error: the interpreter needs glibc ${REQUIRED_GLIBC}, newer than the supported ${MAX_GLIBC}" >&2
-        exit 1
-    fi
+    # Only glibc's own libraries may be linked dynamically, from MAX_GLIBC on
+    sh "$EXT_SRC/.github/scripts/check-linux-elf.sh" "$PHP" "$MAX_GLIBC" \
+        'libc.so.*' 'libm.so.*' 'libdl.so.*' 'libpthread.so.*' 'librt.so.*' 'libresolv.so.*' 'ld-linux*'
 else
-    # Only the system's own libraries and frameworks may be linked, not e.g.
-    # Homebrew's (which the interpreter needed before it was built with StaticPHP)
+    # Only the system's own libraries and frameworks may be linked, not e.g. Homebrew's
     LINKED=$(otool -L "$PHP" | tail -n +2 | awk '{print $1}')
     echo "Linked libraries:" $LINKED
     for lib in $LINKED; do
@@ -285,7 +255,7 @@ else
 
     MINOS=$(otool -l "$PHP" | awk '/LC_BUILD_VERSION/ { found = 1 } found && $1 == "minos" { print $2; exit }')
     echo "Requires macOS: $MINOS"
-    if [ -z "$MINOS" ] || ! version_at_most "$MINOS" "$MIN_MACOS"; then
+    if [ -z "$MINOS" ] || [ "$(printf '%s\n%s\n' "$MINOS" "$MIN_MACOS" | sort -V | tail -1)" != "$MIN_MACOS" ]; then
         echo "error: the interpreter needs macOS '${MINOS}', not at most ${MIN_MACOS}" >&2
         exit 1
     fi
@@ -319,10 +289,6 @@ echo "Exports the PHP API: $(echo "$EXPORTED" | grep -c '^zend_\|^php_\|^add_\|^
     if ((bool) PHP_ZTS !== ($argv[2] === "ts")) { fwrite(STDERR, "thread safety mismatch\n"); exit(1); }
 ' "$EXTENSIONS" "$TS"
 
-# DBGp smoke test: a debug client actually attaches and drives a script. Run
-# from a copy, since the test runner writes files next to the tests.
-cp -r "$EXT_SRC" "$WORK/tests-src"
-cd "$WORK/tests-src"
-TEST_PHP_EXECUTABLE="$PHP" TEST_PHP_ARGS="-n" "$PHP" -n run-xdebug-tests.php -q tests/debugger/bug00530.phpt
+sh "$EXT_SRC/.github/scripts/smoke-test.sh" "$PHP" "$EXT_SRC"
 
 cp "$PHP" "$OUT"

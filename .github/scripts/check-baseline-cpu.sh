@@ -6,11 +6,13 @@
 # every other check and only crashes, with "Illegal instruction", on users'
 # older machines. Here it crashes in CI instead.
 #
-# Run it in a Debian 13 container, not on the runner itself: the binary uses the
-# system's dynamic loader and glibc, and the ubuntu-26.04 runner's are built
+# It runs itself in a Debian 13 container, not on the runner: the binary uses
+# the system's dynamic loader and glibc, and the ubuntu-26.04 runner's are built
 # for AVX-capable CPUs, so even a baseline binary crashes there. Debian 13's
 # are built for baseline x86-64. (Its glibc, 2.41, is newer than the binaries
-# need; the oldest glibc is checked separately, on AlmaLinux 9.)
+# need; the oldest glibc is checked separately, on AlmaLinux 9.) The workspace
+# and RUNNER_TEMP are mounted at the same paths, so every path given, including
+# those in the php options, must be in one of them.
 #
 # Usage: check-baseline-cpu.sh <php binary> <extension source dir> [php options, e.g. -d zend_extension=...]
 set -eu
@@ -19,15 +21,21 @@ PHP="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 EXT_SRC=$(cd "$2" && pwd)
 shift 2
 
+if [ -z "${IN_BASELINE_CPU_CONTAINER:-}" ]; then
+    SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    exec docker run --rm -e IN_BASELINE_CPU_CONTAINER=1 \
+        -v "${GITHUB_WORKSPACE:?}:$GITHUB_WORKSPACE:ro" -v "${RUNNER_TEMP:?}:$RUNNER_TEMP:ro" \
+        debian:13-slim sh -euc 'apt-get -qq update && apt-get -qq install -y qemu-user >/dev/null && exec sh "$@"' \
+        sh "$SELF" "$PHP" "$EXT_SRC" "$@"
+fi
+
 case "$(uname -m)" in
     aarch64) QEMU=qemu-aarch64; CPU=cortex-a53 ;;
     x86_64) QEMU=qemu-x86_64; CPU=qemu64 ;;
     *) echo "error: no baseline CPU known for $(uname -m)" >&2; exit 1 ;;
 esac
 
-WORK="${RUNNER_TEMP:-/tmp}/baseline-cpu"
-rm -rf "$WORK"
-mkdir -p "$WORK"
+WORK=$(mktemp -d)
 # A php that always runs on the baseline CPU, with the given options
 cat > "$WORK/php" <<WRAPPER
 #!/bin/sh
@@ -55,7 +63,5 @@ echo "Running on QEMU $CPU"
     echo "Workload passed\n";
 '
 
-# DBGp smoke test: the debugger itself, on the baseline CPU
-cp -r "$EXT_SRC" "$WORK/src"
-cd "$WORK/src"
-TEST_PHP_EXECUTABLE="$WORK/php" TEST_PHP_ARGS="-n" "$WORK/php" -n run-xdebug-tests.php -q tests/debugger/bug00530.phpt
+# The debugger itself, on the baseline CPU
+sh "$EXT_SRC/.github/scripts/smoke-test.sh" "$WORK/php" "$EXT_SRC"

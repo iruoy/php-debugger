@@ -36,7 +36,7 @@ permissions:
 # Serializes runs per tag, so a rerun (or a race between a human tag push and
 # a prepare-release.yml dispatch for the same version) can't fire two release
 # builds for the same tag in parallel — e.g. two matrices doing duplicate work
-# and softprops/action-gh-release racing to create the same release.
+# and two release jobs racing to create the same release.
 concurrency:
     group: release-${{ github.event.inputs.tag || github.ref_name }}
     # A newer push to a pull request supersedes its older test build
@@ -65,6 +65,13 @@ env:
     # target, StaticPHP's default); the build fails if a binary needs a newer one.
     MIN_MACOS: '12.0'
 
+    # Distributions with the oldest supported glibc (MAX_GLIBC), where the Linux
+    # binaries must load and run
+    GLIBC_DISTROS: almalinux:9 debian:12-slim ubuntu:22.04
+
+    # Release assets are published by the release job, so the artifacts only
+    # need to outlive the run (and its reruns)
+    ARTIFACT_RETENTION_DAYS: 7
 
 jobs:
     # Checks the tag, then resolves what every build job needs.
@@ -118,7 +125,7 @@ jobs:
                 run: |
                     SOURCES=$(python3 .github/scripts/resolve-php-sources.py)
                     echo "php-sources=${SOURCES}" >> "$GITHUB_OUTPUT"
-                    echo "php-versions=$(echo "$SOURCES" | python3 -c 'import json, sys; print(json.dumps(list(json.load(sys.stdin))))')" >> "$GITHUB_OUTPUT"
+                    echo "php-versions=$(echo "$SOURCES" | jq -c keys_unsorted)" >> "$GITHUB_OUTPUT"
 
     # The standalone Linux and macOS interpreters are built with StaticPHP, see
     # .github/scripts/build-interpreter.sh: every library is linked in
@@ -170,12 +177,15 @@ jobs:
 
             # Downloads the library sources and writes what decides the build
             # (StaticPHP's commit, the target, each library's version and hash)
-            # to staticphp-libs.key, the cache key below
+            # to staticphp-libs.key, whose hash is in the cache key
             -   name: Resolve the libraries
+                id: libs
                 env:
                     # StaticPHP looks up its library sources through the GitHub API
                     GITHUB_TOKEN: ${{ github.token }}
-                run: sh .github/scripts/build-interpreter.sh libs-prepare staticphp-libs.key
+                run: |
+                    sh .github/scripts/build-interpreter.sh libs-prepare staticphp-libs.key
+                    echo "cache-key=staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-$(shasum -a 256 staticphp-libs.key | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
             # Only pull request runs, which publish nothing, use cached libraries.
             # Release runs always build them: the key is predictable and a built
@@ -189,7 +199,7 @@ jobs:
                 uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
                 with:
                     path: ${{ runner.temp }}/staticphp-libs.tar.gz
-                    key: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-${{ hashFiles('staticphp-libs.key') }}
+                    key: ${{ steps.libs.outputs.cache-key }}
 
             -   name: Build the libraries
                 if: steps.cache.outputs.cache-hit != 'true'
@@ -203,7 +213,7 @@ jobs:
                 uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
                 with:
                     path: ${{ runner.temp }}/staticphp-libs.tar.gz
-                    key: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-${{ hashFiles('staticphp-libs.key') }}
+                    key: ${{ steps.libs.outputs.cache-key }}
 
             -   name: Upload libraries
                 uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -212,6 +222,8 @@ jobs:
                     name: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
                     path: ${{ runner.temp }}/staticphp-libs.tar.gz
                     retention-days: 1
+                    # Already a .tar.gz
+                    compression-level: 0
 
     build-macos:
         needs: prepare
@@ -244,12 +256,11 @@ jobs:
                     ./configure --enable-php-debugger
                     make -j$(sysctl -n hw.logicalcpu 2>/dev/null || nproc)
 
-            # Loads, and a debug client can attach and drive a script (DBGp smoke test)
+            # Loads, and a debug client can attach and drive a script
             -   name: Test extension
                 run: |
                     php -n -d zend_extension="$PWD/modules/php_debugger.so" -v
-                    TEST_PHP_ARGS="-n -d zend_extension=$PWD/modules/php_debugger.so" \
-                      php -n run-xdebug-tests.php -q tests/debugger/bug00530.phpt
+                    sh .github/scripts/smoke-test.sh "$(command -v php)" . -d zend_extension="$PWD/modules/php_debugger.so"
 
             -   name: Package artifact
                 run: |
@@ -266,6 +277,7 @@ jobs:
                 with:
                     name: release--macos-${{ matrix.php-version }}-${{ matrix.ts }}
                     path: dist/
+                    retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
     build-linux:
         needs: prepare
@@ -315,41 +327,31 @@ jobs:
             -   name: Check it loads on older distros
                 if: matrix.libc == 'glibc'
                 run: |
-                    for image in almalinux:9 debian:12-slim ubuntu:22.04; do
+                    for image in $GLIBC_DISTROS; do
                         echo "== ${image}"
                         docker run --rm -v "$RUNNER_TEMP/php-debugger-build:/b:ro" "$image" \
                           /b/php/bin/php -n -d zend_extension=/b/ext/modules/php_debugger.so -r 'exit(extension_loaded("php_debugger") ? 0 : 1);'
                     done
 
-            # GitHub's runners have recent CPUs; run on the oldest CPU model of the
-            # architecture too, so instructions older CPUs lack fail here instead of
-            # on users' machines. (The musl build uses the same compiler settings.)
-            # In Debian 13, see the script for why not on the runner itself.
+            # On the oldest CPU model of the architecture, see the script. (The
+            # musl build uses the same compiler settings.)
             -   name: Check it runs on a baseline CPU
                 if: matrix.libc == 'glibc'
                 run: |
-                    docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/php-debugger-build:/b:ro" debian:13-slim sh -euc '
-                        apt-get -qq update && apt-get -qq install -y qemu-user >/dev/null
-                        sh /src/.github/scripts/check-baseline-cpu.sh /b/php/bin/php /src -d zend_extension=/b/ext/modules/php_debugger.so
-                    '
+                    B="$RUNNER_TEMP/php-debugger-build"
+                    sh .github/scripts/check-baseline-cpu.sh "$B/php/bin/php" . -d zend_extension="$B/ext/modules/php_debugger.so"
 
             # The runner cannot run a musl PHP, so test in the official Alpine image
             # of the same version and thread safety. There is none for NTS 8.6+:
             # from 8.6 on the official images are ZTS only (and -zts is gone).
             -   name: Test in Alpine
                 if: matrix.libc == 'musl' && (matrix.ts == 'ts' || contains(fromJSON('["8.2", "8.3", "8.4", "8.5"]'), matrix.php-version))
+                env:
+                    IMAGE: php:${{ matrix.php-version }}-${{ (matrix.ts == 'ts' && contains(fromJSON('["8.2", "8.3", "8.4", "8.5"]'), matrix.php-version)) && 'zts' || 'cli' }}-alpine
                 run: |
-                    case "${{ matrix.ts }}-${{ matrix.php-version }}" in
-                        nts-*) IMAGE="php:${{ matrix.php-version }}-cli-alpine" ;;
-                        ts-8.[2-5]) IMAGE="php:${{ matrix.php-version }}-zts-alpine" ;;
-                        *) IMAGE="php:${{ matrix.php-version }}-cli-alpine" ;;
-                    esac
                     docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/out:/out:ro" "$IMAGE" sh -euc '
-                        cp -r /src /tmp/src && cd /tmp/src
-                        PHP=$(command -v php)
-                        "$PHP" -n -d zend_extension=/out/php_debugger.so -v
-                        TEST_PHP_EXECUTABLE="$PHP" TEST_PHP_ARGS="-n -d zend_extension=/out/php_debugger.so" \
-                          "$PHP" -n run-xdebug-tests.php -q tests/debugger/bug00530.phpt
+                        php -n -d zend_extension=/out/php_debugger.so -v
+                        sh /src/.github/scripts/smoke-test.sh "$(command -v php)" /src -d zend_extension=/out/php_debugger.so
                     '
 
             -   name: Package artifact
@@ -373,6 +375,7 @@ jobs:
                 with:
                     name: release--linux-${{ matrix.php-version }}-${{ matrix.ts }}-${{ matrix.arch.arch }}-${{ matrix.libc }}
                     path: dist/
+                    retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
     build-windows:
         needs: prepare
@@ -428,6 +431,7 @@ jobs:
                 with:
                     name: release--windows-${{ matrix.php-version }}-${{ matrix.ts }}
                     path: dist/
+                    retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
     build-php-unix:
         needs: [prepare, build-php-libs]
@@ -495,16 +499,10 @@ jobs:
                     sh .github/scripts/build-interpreter.sh php "$PHP_URL" "$PHP_SHA256" "${{ matrix.ts }}" . \
                       "dist/$BINARY" "$RUNNER_TEMP/staticphp-libs.tar.gz"
 
-            # GitHub's runners have recent CPUs; run on the oldest CPU model of the
-            # architecture too, so instructions older CPUs lack fail here instead of
-            # on users' machines. In Debian 13, see the script for why not on the runner.
+            # On the oldest CPU model of the architecture, see the script
             -   name: Check it runs on a baseline CPU
                 if: matrix.platform.os == 'linux'
-                run: |
-                    docker run --rm -v "$PWD:/src:ro" debian:13-slim sh -euc '
-                        apt-get -qq update && apt-get -qq install -y qemu-user >/dev/null
-                        sh /src/.github/scripts/check-baseline-cpu.sh "/src/dist/$0" /src
-                    ' "$BINARY"
+                run: sh .github/scripts/check-baseline-cpu.sh "dist/$BINARY" .
 
             # Extensions from a distribution's PHP must load into the interpreter
             # (php-debugger/installer keeps a replaced PHP's extensions), including
@@ -525,7 +523,7 @@ jobs:
             -   name: Check it runs on other distros
                 if: matrix.platform.os == 'linux'
                 run: |
-                    for image in almalinux:9 debian:12-slim ubuntu:22.04 ubuntu:26.04; do
+                    for image in $GLIBC_DISTROS ubuntu:26.04; do
                         echo "== ${image}"
                         docker run --rm -v "$PWD/dist:/dist:ro" "$image" "/dist/$BINARY" -n -v
                     done
@@ -535,6 +533,7 @@ jobs:
                 with:
                     name: release--${{ env.BINARY }}
                     path: dist/
+                    retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
     # Builds the self-contained Windows PHP interpreter with php_debugger compiled in
     # statically, packaged as a zip in the same layout as the windows.php.net
@@ -565,6 +564,8 @@ jobs:
         # VS 2026 (needed for PHP 8.6 and later) is only on the windows-2025-vs2026 image
         runs-on: ${{ contains(fromJSON('["8.2", "8.3", "8.4", "8.5"]'), matrix.php-version) && 'windows-2022' || 'windows-2025-vs2026' }}
         name: "PHP Binary Windows — PHP ${{ matrix.php-version }} — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
+        env:
+            ASSET: php-php${{ matrix.php-version }}-${{ matrix.ts }}-windows-x64.zip
         steps:
             -   name: Checkout extension
                 uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -649,7 +650,6 @@ jobs:
                     Invoke-PhpBuild -Arch x64 -Ts "${{ matrix.ts }}"
 
             -   name: Package the interpreter bundle
-                id: package
                 shell: pwsh
                 run: |
                     $zips = @(Get-ChildItem C:\php-build\php-src\artifacts -Filter 'php-*.zip' |
@@ -658,19 +658,16 @@ jobs:
                         Get-ChildItem C:\php-build\php-src\artifacts | Format-Table Name, Length
                         Write-Error "expected exactly one PHP binary zip, found $($zips.Count)"; exit 1
                     }
-                    $assetName = "php-php${{ matrix.php-version }}-${{ matrix.ts }}-windows-x64.zip"
-                    Write-Host "Packaging $($zips[0].Name) as $assetName"
-                    Copy-Item $zips[0].FullName -Destination $assetName
-                    Add-Content -Path $env:GITHUB_OUTPUT -Value "asset_name=${assetName}" -Encoding utf8
+                    Write-Host "Packaging $($zips[0].Name) as $env:ASSET"
+                    Copy-Item $zips[0].FullName -Destination $env:ASSET
 
             -   name: Test the bundle from a clean directory
                 shell: pwsh
                 run: |
                     # Unpack outside the build tree, so php.exe can only use the DLLs
-                    # shipped in the zip. The old bare-php.exe asset passed CI only
-                    # because its test ran next to php8.dll in the build directory.
+                    # shipped in the zip
                     $dir = Join-Path $env:RUNNER_TEMP 'php-bundle'
-                    Expand-Archive -Path "${{ steps.package.outputs.asset_name }}" -DestinationPath $dir
+                    Expand-Archive -Path $env:ASSET -DestinationPath $dir
                     $php = Join-Path $dir 'php.exe'
                     if (-not (Test-Path $php)) { Write-Error "php.exe is not at the root of the bundle"; exit 1 }
 
@@ -713,9 +710,9 @@ jobs:
             -   name: Upload artifact
                 uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
                 with:
-                    # release.yml publishes artifacts named release--*
-                    name: release--${{ steps.package.outputs.asset_name }}
-                    path: ${{ steps.package.outputs.asset_name }}
+                    name: release--${{ env.ASSET }}
+                    path: ${{ env.ASSET }}
+                    retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
     release:
         needs: [build-macos, build-linux, build-windows, build-php-unix, build-php-windows]
@@ -725,10 +722,6 @@ jobs:
             contents: write
             actions: write
         steps:
-            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-                with:
-                    ref: ${{ env.RELEASE_REF }}
-
             # Every build job uploads exactly the files it publishes, in an
             # artifact named release--*. Other artifacts in the run, such as
             # php-windows-builder's own uploads, are left out.
@@ -756,33 +749,18 @@ jobs:
                     fi
 
             -   name: Trigger Docker image build
-                # This step's own release-publish above used GITHUB_TOKEN, and GitHub
-                # Actions deliberately doesn't let a GITHUB_TOKEN-authored event —
-                # including the `release: published` event that action just fired —
-                # trigger other workflows (the same anti-recursion protection that made
-                # prepare-release.yml's tag push not trigger this workflow). So
-                # docker.yml's `release: published` trigger never fires here either;
-                # dispatch it explicitly instead. target=prod is required: without it,
-                # docker.yml only auto-selects prod for an actual `release` event, and a
-                # workflow_dispatch run would otherwise default to pushing -dev images.
-                #
-                # No tag is passed through: docker.yml resolves "which release to build"
-                # from `gh release view` (latest published) when dispatched manually. That
-                # means re-releasing an older tag via this workflow's own workflow_dispatch
-                # (e.g. rebuilding 0.1.5 while 0.2.3 is latest) will publish Docker images
-                # for whatever is currently latest, not the tag just released. Fine for the
-                # normal case (releasing the newest tag) — if you ever need to re-release an
-                # older tag's Docker images specifically, dispatch docker.yml by hand instead.
-                # The GitHub release above has already been published by this point — a
-                # failure here means the docker.yml mirror didn't get kicked off, not that
-                # the release itself failed. Warn rather than fail the job, so a red X here
-                # doesn't get misread as "the release failed and needs rerunning".
+                # docker.yml's `release: published` trigger does not fire for a
+                # release published with GITHUB_TOKEN (GitHub's anti-recursion
+                # protection), so dispatch it. target=prod is required, a dispatch
+                # defaults to the -dev images. docker.yml builds the latest release,
+                # so re-releasing an older tag needs docker.yml run by hand. The
+                # release is already published here, so a failure only warns.
                 if: github.repository == 'php-debugger/php-debugger'
                 env:
                     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                 run: |
                     for attempt in 1 2 3; do
-                        gh workflow run docker.yml --ref main -f target=prod && exit 0
+                        gh workflow run docker.yml --repo "$GITHUB_REPOSITORY" --ref main -f target=prod && exit 0
                         [ "$attempt" -lt 3 ] && sleep 5
                     done
                     echo "::warning::Failed to dispatch docker.yml after 3 attempts — the release itself published fine, but rerun docker.yml manually from the Actions UI with target=prod to publish matching Docker images"

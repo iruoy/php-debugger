@@ -17,7 +17,7 @@
 # the workflow.
 #
 # Usage: build-linux-binary.sh <php tarball url> <sha256> <nts|ts> <zig target> <extension source dir> <output dir>
-# (the tarball as resolved by resolve-php-sources.py)
+# (the tarball and its sha256 as resolved by resolve-php-sources.py)
 set -eu
 
 PHP_URL="$1"
@@ -59,38 +59,20 @@ make -s -j"$(nproc)" >/dev/null
 EXT="$WORK/ext/modules/php_debugger.so"
 file "$EXT"
 
-# Only the C library (and libm) may be linked dynamically
-NEEDED=$(readelf -d "$EXT" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
-echo "Linked libraries:" $NEEDED
-for lib in $NEEDED; do
-    case "$lib" in
-        libc.so|libc.so.*|libm.so.*) ;;
-        *) echo "error: the extension links $lib" >&2; exit 1 ;;
-    esac
-done
+# Only the C library (and libm) may be linked dynamically, and for a glibc
+# target, no newer glibc than the target's
+MAX_GLIBC=""
+case "$TARGET" in *-gnu.*) MAX_GLIBC="${TARGET##*-gnu.}" ;; esac
+sh "$EXT_SRC/.github/scripts/check-linux-elf.sh" "$EXT" "$MAX_GLIBC" 'libc.so' 'libc.so.*' 'libm.so.*'
 
-case "$TARGET" in
-    *-gnu.*)
-        # The newest glibc symbol version the binary needs must not exceed the target's
-        MAX_GLIBC="${TARGET##*-gnu.}"
-        REQUIRED_GLIBC=$(grep -ao 'GLIBC_[0-9][0-9.]*' "$EXT" | sed 's/^GLIBC_//' | sort -uV | tail -1)
-        echo "Requires glibc: ${REQUIRED_GLIBC} (target ${MAX_GLIBC})"
-        if [ -z "$REQUIRED_GLIBC" ] || [ "$(printf '%s\n%s\n' "$REQUIRED_GLIBC" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
-            echo "error: the extension needs glibc '${REQUIRED_GLIBC}', not at most ${MAX_GLIBC}" >&2
-            exit 1
-        fi
+if [ -n "$MAX_GLIBC" ]; then
+    PHP="$WORK/php/bin/php"
+    "$PHP" -n -d zend_extension="$EXT" -v
+    "$PHP" -n -d zend_extension="$EXT" -r '
+        if (!function_exists("xdebug_info") || !function_exists("php_debugger_info")) { fwrite(STDERR, "functions missing\n"); exit(1); }
+        if ((bool) PHP_ZTS !== ($argv[1] === "ts")) { fwrite(STDERR, "thread safety mismatch\n"); exit(1); }
+    ' "$TS"
+    sh "$EXT_SRC/.github/scripts/smoke-test.sh" "$PHP" "$EXT_SRC" -d zend_extension="$EXT"
+fi
 
-        PHP="$WORK/php/bin/php"
-        "$PHP" -n -d zend_extension="$EXT" -v
-        "$PHP" -n -d zend_extension="$EXT" -r '
-            if (!function_exists("xdebug_info") || !function_exists("php_debugger_info")) { fwrite(STDERR, "functions missing\n"); exit(1); }
-            if ((bool) PHP_ZTS !== ($argv[1] === "ts")) { fwrite(STDERR, "thread safety mismatch\n"); exit(1); }
-        ' "$TS"
-        # DBGp smoke test: a debug client actually attaches and drives a script
-        TEST_PHP_EXECUTABLE="$PHP" TEST_PHP_ARGS="-n -d zend_extension=$EXT" \
-            "$PHP" -n run-xdebug-tests.php -q tests/debugger/bug00530.phpt
-        ;;
-esac
-
-mkdir -p "$OUT_DIR"
 cp "$EXT" "$OUT_DIR/php_debugger.so"
