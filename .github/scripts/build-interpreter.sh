@@ -1,10 +1,14 @@
 #!/bin/sh
-# Builds the standalone Linux PHP interpreter (the php-php{ver}-{ts}-linux-{arch}
-# release assets): a PHP CLI with php_debugger compiled in, built with StaticPHP
-# (static-php-cli) v3 on a GitHub runner. Every library is linked in statically
-# except glibc, and StaticPHP's zig toolchain targets glibc MAX_GLIBC, so the
-# binary runs on any distro with that glibc or newer (2.34: Debian 12+, Ubuntu
-# 22.04+, RHEL 9+) without needing libxml2, OpenSSL, curl and so on installed.
+# Builds the standalone PHP interpreters for Linux and macOS (the
+# php-php{ver}-{ts}-{linux,macos}-{arch} release assets): a PHP CLI with
+# php_debugger compiled in, built with StaticPHP (static-php-cli) v3 on a GitHub
+# runner. Every library (libxml2, OpenSSL, curl, ...) is linked in statically,
+# so nothing needs to be installed for it to run:
+# - Linux: only glibc is linked dynamically, and StaticPHP's zig toolchain
+#   targets glibc MAX_GLIBC, so it runs on any distro with that glibc or newer
+#   (2.34: Debian 12+, Ubuntu 22.04+, RHEL 9+).
+# - macOS: only the system's own libraries and frameworks are linked, built for
+#   macOS MIN_MACOS and newer.
 # It can still load shared extensions, which php-debugger/installer relies on
 # when it keeps a replaced PHP's extensions.
 #
@@ -26,9 +30,9 @@
 #       the archive it still builds itself)
 # (the tarball as resolved by resolve-php-sources.py)
 #
-# Needs MAX_GLIBC and GITHUB_TOKEN in the environment (StaticPHP looks up its
-# library sources through the GitHub API), PHP 8.4+ and composer to run
-# StaticPHP (the GitHub runners have both), and re2c and gettext installed.
+# Needs GITHUB_TOKEN (StaticPHP looks up its library sources through the GitHub
+# API) and MAX_GLIBC (Linux) or MIN_MACOS (macOS) in the environment, PHP 8.4+
+# and composer to run StaticPHP, and on Linux re2c and gettext installed.
 set -eu
 
 MODE="$1"
@@ -40,11 +44,20 @@ EXTENSIONS="ctype,curl,dom,fileinfo,filter,iconv,mbstring,mysqlnd,opcache,openss
 # a library missing here is still built by every "php" step, just not shared.
 LIBRARIES="zlib,openssl,libiconv,xz,libxml2,libsodium,ncurses,libedit,curl,libargon2,sqlite"
 
-# Link against glibc instead of musl, targeting the oldest version supported.
-# With a target set, StaticPHP builds with its zig toolchain. The architecture
-# is named explicitly: "native" would also mean the runner's CPU, and zig would
-# use instructions that older CPUs (and Apple Silicon VMs) do not have.
-export SPC_TARGET="$(uname -m)-linux-gnu.${MAX_GLIBC}"
+OS=$(uname -s)
+if [ "$OS" = Linux ]; then
+    # Link against glibc instead of musl, targeting the oldest version supported.
+    # With a target set, StaticPHP builds with its zig toolchain. The architecture
+    # is named explicitly: "native" would also mean the runner's CPU, and zig would
+    # use instructions that older CPUs (and Apple Silicon VMs) do not have.
+    export SPC_TARGET="$(uname -m)-linux-gnu.${MAX_GLIBC}"
+    TARGET_DESCRIPTION="$SPC_TARGET"
+else
+    # StaticPHP's default macOS target (clang for the machine's architecture,
+    # whose default CPU is the architecture's baseline), for this macOS and newer
+    export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS"
+    TARGET_DESCRIPTION="macos-$(uname -m)-${MIN_MACOS}"
+fi
 
 WORK="${RUNNER_TEMP:-/tmp}/staticphp"
 
@@ -77,7 +90,7 @@ if [ "$MODE" = libs-prepare ]; then
     spc download --for-packages="$LIBRARIES"
     {
         echo "staticphp $STATICPHP_COMMIT"
-        echo "target $SPC_TARGET"
+        echo "target $TARGET_DESCRIPTION"
         echo "libraries $LIBRARIES"
         python3 -c '
 import json, sys
@@ -143,40 +156,80 @@ spc download php-src --custom-local="php-src:$PHP_SRC"
 # it out (an optional fast path for PHP). PHP 8.6 bundles Libtool 2.5, which
 # rejects --with-pic in favour of --enable-pic; 8.2-8.5 bundle Libtool 1.5,
 # which only knows --with-pic.
-case "$(grep -o 'PHP_VERSION "[0-9]*\.[0-9]*' "$PHP_SRC/main/php_version.h" | cut -d'"' -f2)" in
+PHP_MINOR=$(grep -o 'PHP_VERSION "[0-9]*\.[0-9]*' "$PHP_SRC/main/php_version.h" | cut -d'"' -f2)
+PHP_FULL=$(grep -o 'PHP_VERSION "[0-9.]*' "$PHP_SRC/main/php_version.h" | cut -d'"' -f2)
+case "$PHP_MINOR" in
     8.[2-5]) PIC_FLAG=--with-pic ;;
     *) PIC_FLAG=--enable-pic ;;
 esac
 ZTS_ARG=""
 [ "$TS" = "ts" ] && ZTS_ARG="--enable-zts"
+# Where PHP looks for its configuration and, from the prefix, its extensions
+# (php-debugger/installer copies a replaced PHP's extensions there), as the
+# interpreters were built before: PHP's default /usr/local on Linux, and
+# Homebrew's layout on macOS
+if [ "$OS" = Linux ]; then
+    PATHS="--prefix=/usr/local"
+    CONFIG_DIR=/usr/local/etc/php
+    SYSCONFDIR_ARG=""
+else
+    PATHS="--prefix=/opt/homebrew/Cellar/php@${PHP_MINOR}/${PHP_FULL} --localstatedir=/opt/homebrew/var"
+    CONFIG_DIR="/opt/homebrew/etc/php/${PHP_MINOR}"
+    SYSCONFDIR_ARG="--with-sysconfdir=$CONFIG_DIR"
+fi
 # --no-smoke-test: the checks below cover the same (the binary runs, the
 # extensions load) plus the debugger itself
-SPC_CMD_PREFIX_PHP_CONFIGURE="./configure --prefix= --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-rtld-now --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger ac_cv_have_decl_epoll_pwait2=no" \
+SPC_CMD_PREFIX_PHP_CONFIGURE="./configure $PATHS --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-rtld-now --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger ac_cv_have_decl_epoll_pwait2=no" \
     spc build:php-cli "$EXTENSIONS" $ZTS_ARG \
         --no-smoke-test \
-        --disable-opcache-jit \
-        --with-config-file-path=/usr/local/etc/php \
-        --with-config-file-scan-dir=/usr/local/etc/php/conf.d \
+        --disable-opcache-jit $SYSCONFDIR_ARG \
+        --with-config-file-path="$CONFIG_DIR" \
+        --with-config-file-scan-dir="$CONFIG_DIR/conf.d" \
     || { tail -n 60 "$WORK/log/spc.shell.log" >&2; exit 1; }
 
 PHP="$WORK/buildroot/bin/php"
 file "$PHP"
 
-# Only glibc's own libraries may be linked dynamically
-NEEDED=$(readelf -d "$PHP" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
-echo "Linked libraries:" $NEEDED
-for lib in $NEEDED; do
-    case "$lib" in
-        libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|libresolv.so.*|ld-linux*) ;;
-        *) echo "error: the interpreter links $lib dynamically" >&2; exit 1 ;;
-    esac
-done
+# Returns whether version $1 is at most version $2
+version_at_most() {
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]
+}
 
-REQUIRED_GLIBC=$(grep -ao 'GLIBC_[0-9][0-9.]*' "$PHP" | sed 's/^GLIBC_//' | sort -uV | tail -1)
-echo "Requires glibc: $REQUIRED_GLIBC"
-if [ "$(printf '%s\n%s\n' "$REQUIRED_GLIBC" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
-    echo "error: the interpreter needs glibc ${REQUIRED_GLIBC}, newer than the supported ${MAX_GLIBC}" >&2
-    exit 1
+if [ "$OS" = Linux ]; then
+    # Only glibc's own libraries may be linked dynamically
+    NEEDED=$(readelf -d "$PHP" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+    echo "Linked libraries:" $NEEDED
+    for lib in $NEEDED; do
+        case "$lib" in
+            libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|libresolv.so.*|ld-linux*) ;;
+            *) echo "error: the interpreter links $lib dynamically" >&2; exit 1 ;;
+        esac
+    done
+
+    REQUIRED_GLIBC=$(grep -ao 'GLIBC_[0-9][0-9.]*' "$PHP" | sed 's/^GLIBC_//' | sort -uV | tail -1)
+    echo "Requires glibc: $REQUIRED_GLIBC"
+    if ! version_at_most "$REQUIRED_GLIBC" "$MAX_GLIBC"; then
+        echo "error: the interpreter needs glibc ${REQUIRED_GLIBC}, newer than the supported ${MAX_GLIBC}" >&2
+        exit 1
+    fi
+else
+    # Only the system's own libraries and frameworks may be linked, not e.g.
+    # Homebrew's (which the interpreter needed before it was built with StaticPHP)
+    LINKED=$(otool -L "$PHP" | tail -n +2 | awk '{print $1}')
+    echo "Linked libraries:" $LINKED
+    for lib in $LINKED; do
+        case "$lib" in
+            /usr/lib/*|/System/Library/Frameworks/*) ;;
+            *) echo "error: the interpreter links $lib" >&2; exit 1 ;;
+        esac
+    done
+
+    MINOS=$(otool -l "$PHP" | awk '/LC_BUILD_VERSION/ { found = 1 } found && $1 == "minos" { print $2; exit }')
+    echo "Requires macOS: $MINOS"
+    if [ -z "$MINOS" ] || ! version_at_most "$MINOS" "$MIN_MACOS"; then
+        echo "error: the interpreter needs macOS '${MINOS}', not at most ${MIN_MACOS}" >&2
+        exit 1
+    fi
 fi
 
 "$PHP" -n -v
