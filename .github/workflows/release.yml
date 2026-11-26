@@ -501,6 +501,22 @@ jobs:
                         sh /src/.github/scripts/check-baseline-cpu.sh "/src/dist/$0" /src
                     ' "$BINARY"
 
+            # Extensions from a distribution's PHP must load into the interpreter
+            # (php-debugger/installer keeps a replaced PHP's extensions), including
+            # ones that call PCRE2 by its standard names, like apcu. Debian 13
+            # packages PHP 8.4, so this runs in the matching jobs.
+            -   name: Check it loads Debian's packaged extensions
+                if: matrix.platform.os == 'linux' && matrix.php-version == '8.4' && matrix.ts == 'nts'
+                run: |
+                    docker run --rm -v "$PWD/dist:/dist:ro" debian:13-slim sh -euc '
+                        apt-get -qq update && apt-get -qq install -y php8.4-cli php8.4-apcu php8.4-imagick >/dev/null
+                        E=$(php -r "echo ini_get(\"extension_dir\");")
+                        "/dist/$0" -n -d "extension=$E/apcu.so" -d apc.enable_cli=1 \
+                          -r "apcu_store(\"k\", 42); if (apcu_fetch(\"k\") !== 42) exit(1); echo \"apcu works\n\";"
+                        "/dist/$0" -n -d "extension=$E/imagick.so" \
+                          -r "\$i = new Imagick(); \$i->newImage(2, 2, \"red\"); if (\$i->getImageWidth() !== 2) exit(1); echo \"imagick works\n\";"
+                    ' "$BINARY"
+
             -   name: Check it runs on other distros
                 if: matrix.platform.os == 'linux'
                 run: |

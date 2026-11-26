@@ -190,9 +190,30 @@ fi
 #   loads (e.g. pcre2_* in extensions built against an external PCRE2)
 # - macOS: no -dead_strip (StaticPHP's default linker flag), which removes the
 #   PHP API functions PHP itself does not call, so extensions fail to load
+# - PCRE2 under both names: PHP's bundled PCRE2 functions are called
+#   php_pcre2_* (main/php_compat.h), which extensions built against a PHP
+#   with bundled PCRE2 use (the official Docker images, PECL builds). The
+#   distributions' and Homebrew's PHP use the system PCRE2 instead, so their
+#   extensions call the standard pcre2_*_8 names, and on Linux bind them when
+#   they load. Export every bundled function under its standard name too, as
+#   an alias of the same function, so both kinds of extensions load.
 if [ "$OS" = Darwin ]; then
     export SPC_DEFAULT_LDFLAGS=""
 fi
+# Only functions get an alias: php_compat.h also renames a typedef
+# (pcre2_jit_callback), recognisable as not being declared as "name(" in pcre2.h.
+PCRE2_NAMES=$(sed -n 's/^#define[[:space:]]*\(pcre2_[a-z0-9_]*_8\)[[:space:]]*\(php_pcre2_[a-z0-9_]*\)[[:space:]]*$/\2 \1/p' "$PHP_SRC/main/php_compat.h" \
+    | while read -r bundled standard; do
+        grep -q "\b${standard%_8}(" "$PHP_SRC/ext/pcre/pcre2lib/pcre2.h" && echo "$bundled $standard"
+    done)
+[ -n "$PCRE2_NAMES" ] || { echo "error: no PCRE2 names found in main/php_compat.h" >&2; exit 1; }
+if [ "$OS" = Linux ]; then
+    PCRE2_ALIASES=$(echo "$PCRE2_NAMES" | awk '{ printf " -Wl,--defsym=%s=%s", $2, $1 }')
+else
+    PCRE2_ALIASES=$(echo "$PCRE2_NAMES" | awk '{ printf " -Wl,-alias,_%s,_%s", $1, $2 }')
+fi
+echo "PCRE2 standard names: $(echo "$PCRE2_NAMES" | wc -l | tr -d ' ')"
+export SPC_CMD_VAR_PHP_MAKE_EXTRA_LDFLAGS_PROGRAM="$PCRE2_ALIASES"
 # --no-smoke-test: the checks below cover the same (the binary runs, the
 # extensions load) plus the debugger itself
 SPC_CMD_PREFIX_PHP_CONFIGURE="./configure $PATHS --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger ac_cv_have_decl_epoll_pwait2=no" \
@@ -255,7 +276,7 @@ if [ "$OS" = Linux ]; then
 else
     EXPORTED=$(nm -gU "$PHP" | awk '{print $3}' | sed 's/^_//')
 fi
-for symbol in zend_parse_parameters zend_declare_property add_next_index_bool _emalloc_3072; do
+for symbol in zend_parse_parameters zend_declare_property add_next_index_bool _emalloc_3072 php_pcre2_match pcre2_match_8; do
     echo "$EXPORTED" | grep -qx "$symbol" || { echo "error: the interpreter does not export $symbol, shared extensions will not load" >&2; exit 1; }
 done
 echo "Exports the PHP API: $(echo "$EXPORTED" | grep -c '^zend_\|^php_\|^add_\|^_e') symbols"
