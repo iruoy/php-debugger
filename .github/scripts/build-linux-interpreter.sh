@@ -12,7 +12,7 @@
 # per PHP version and thread-safety mode (they depend on neither):
 #   libs <output archive>
 #       builds the libraries (and fetches StaticPHP's zig toolchain) and packs
-#       StaticPHP's buildroot/ and pkgroot/ into an archive
+#       StaticPHP's buildroot/, pkgroot/ (zig) and downloads/ into an archive
 #   php <php tarball url> <sha256> <nts|ts> <extension source dir> <output file> [libs archive]
 #       builds the interpreter; with the archive from "libs", StaticPHP finds
 #       those libraries already built and only builds PHP (anything missing from
@@ -61,14 +61,14 @@ setup_staticphp() {
     chmod +x "$WORK/bin/spc"
     export PATH="$WORK/bin:$PATH"
     spc --version
-    spc doctor --auto-fix
 }
 
 if [ "$MODE" = libs ]; then
     OUT="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
     setup_staticphp
+    spc doctor --auto-fix
     spc build:libs "$LIBRARIES" || { tail -n 60 "$WORK/log/spc.shell.log" >&2; exit 1; }
-    tar -czf "$OUT" -C "$WORK" buildroot pkgroot
+    tar -czf "$OUT" -C "$WORK" buildroot pkgroot downloads
     ls -la "$OUT"
     exit 0
 fi
@@ -85,9 +85,12 @@ LIBS_ARCHIVE=""
 [ $# -ge 6 ] && LIBS_ARCHIVE="$(cd "$(dirname "$6")" && pwd)/$(basename "$6")"
 
 setup_staticphp
+# Before doctor: the archive holds StaticPHP's zig, which doctor would otherwise
+# download and install again (minutes)
 if [ -n "$LIBS_ARCHIVE" ]; then
     tar -xzf "$LIBS_ARCHIVE" -C "$WORK"
 fi
+spc doctor --auto-fix
 
 # PHP source: the php.net tarball, with the debugger added as a bundled extension.
 # It goes where StaticPHP keeps the PHP source (source/php-src): for a local
@@ -115,18 +118,15 @@ case "$(grep -o 'PHP_VERSION "[0-9]*\.[0-9]*' "$PHP_SRC/main/php_version.h" | cu
 esac
 ZTS_ARG=""
 [ "$TS" = "ts" ] && ZTS_ARG="--enable-zts"
-if ! SPC_CMD_PREFIX_PHP_CONFIGURE="./configure --prefix= --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-rtld-now --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger ac_cv_have_decl_epoll_pwait2=no" \
+# --no-smoke-test: the checks below cover the same (the binary runs, the
+# extensions load) plus the debugger itself
+SPC_CMD_PREFIX_PHP_CONFIGURE="./configure --prefix= --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-rtld-now --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger ac_cv_have_decl_epoll_pwait2=no" \
     spc build:php-cli "$EXTENSIONS" $ZTS_ARG \
+        --no-smoke-test \
         --disable-opcache-jit \
         --with-config-file-path=/usr/local/etc/php \
         --with-config-file-scan-dir=/usr/local/etc/php/conf.d \
-        > "$WORK/build.log" 2>&1
-then
-    cat "$WORK/build.log"
-    tail -n 60 "$WORK/log/spc.shell.log" >&2
-    exit 1
-fi
-cat "$WORK/build.log"
+    || { tail -n 60 "$WORK/log/spc.shell.log" >&2; exit 1; }
 
 PHP="$WORK/buildroot/bin/php"
 file "$PHP"
