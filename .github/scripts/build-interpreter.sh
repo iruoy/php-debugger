@@ -184,9 +184,18 @@ else
     CONFIG_DIR="/opt/homebrew/etc/php/${PHP_MINOR}"
     SYSCONFDIR_ARG="--with-sysconfdir=$CONFIG_DIR"
 fi
+# Shared extensions must keep loading (the installer keeps a replaced PHP's):
+# - no --enable-rtld-now (StaticPHP's default): like the distributions' and
+#   Homebrew's PHP, symbols an extension never calls need not resolve when it
+#   loads (e.g. pcre2_* in extensions built against an external PCRE2)
+# - macOS: no -dead_strip (StaticPHP's default linker flag), which removes the
+#   PHP API functions PHP itself does not call, so extensions fail to load
+if [ "$OS" = Darwin ]; then
+    export SPC_DEFAULT_LDFLAGS=""
+fi
 # --no-smoke-test: the checks below cover the same (the binary runs, the
 # extensions load) plus the debugger itself
-SPC_CMD_PREFIX_PHP_CONFIGURE="./configure $PATHS --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-rtld-now --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger ac_cv_have_decl_epoll_pwait2=no" \
+SPC_CMD_PREFIX_PHP_CONFIGURE="./configure $PATHS --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --enable-re2c-cgoto --disable-rpath $PIC_FLAG --with-mhash --enable-php-debugger ac_cv_have_decl_epoll_pwait2=no" \
     spc build:php-cli "$EXTENSIONS" $ZTS_ARG \
         --no-smoke-test \
         --disable-opcache-jit $SYSCONFDIR_ARG \
@@ -238,6 +247,18 @@ else
         exit 1
     fi
 fi
+
+# PHP API functions that only extensions use must still be exported, or shared
+# extensions do not load
+if [ "$OS" = Linux ]; then
+    EXPORTED=$(nm -D --defined-only "$PHP" | awk '{print $3}')
+else
+    EXPORTED=$(nm -gU "$PHP" | awk '{print $3}' | sed 's/^_//')
+fi
+for symbol in zend_parse_parameters zend_declare_property add_next_index_bool _emalloc_3072; do
+    echo "$EXPORTED" | grep -qx "$symbol" || { echo "error: the interpreter does not export $symbol, shared extensions will not load" >&2; exit 1; }
+done
+echo "Exports the PHP API: $(echo "$EXPORTED" | grep -c '^zend_\|^php_\|^add_\|^_e') symbols"
 
 "$PHP" -n -v
 "$PHP" -n -r '
