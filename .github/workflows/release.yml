@@ -431,6 +431,11 @@ jobs:
 
     build-php-unix:
         needs: [prepare, build-php-libs]
+        # Each job only uses its own platform's libraries (see "Download the
+        # libraries"), so it runs even if another platform's build-php-libs job
+        # failed, e.g. when no macOS runner was available; the release job still
+        # needs every build to succeed.
+        if: ${{ !cancelled() && needs.prepare.result == 'success' }}
         strategy:
             fail-fast: false
             matrix:
