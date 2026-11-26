@@ -108,7 +108,7 @@ jobs:
                         exit 1
                     fi
 
-            -   uses: actions/checkout@v7
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
                 with:
                     ref: ${{ env.RELEASE_REF }}
                     sparse-checkout: .github/scripts
@@ -119,6 +119,99 @@ jobs:
                     SOURCES=$(python3 .github/scripts/resolve-php-sources.py)
                     echo "php-sources=${SOURCES}" >> "$GITHUB_OUTPUT"
                     echo "php-versions=$(echo "$SOURCES" | python3 -c 'import json, sys; print(json.dumps(list(json.load(sys.stdin))))')" >> "$GITHUB_OUTPUT"
+
+    # The standalone Linux and macOS interpreters are built with StaticPHP, see
+    # .github/scripts/build-interpreter.sh: every library is linked in
+    # statically, so they run without anything installed (Linux: glibc
+    # MAX_GLIBC or newer; macOS: MIN_MACOS or newer) and can still load shared
+    # extensions.
+    #
+    # The libraries depend only on the platform, not on the PHP version or
+    # thread safety, so they are built once per platform here and shared by
+    # the build-php-unix jobs. This job comes first in the file: jobs that are
+    # ready at the same time are queued roughly in file order, and this one is
+    # on the longest path (libraries, then interpreters), so it should get a
+    # runner before the many short extension builds fill them.
+    build-php-libs:
+        needs: prepare
+        strategy:
+            fail-fast: false
+            matrix:
+                platform:
+                    - os: linux
+                      arch: x86_64
+                      runner: ubuntu-26.04
+                    - os: linux
+                      arch: arm64
+                      runner: ubuntu-26.04-arm
+                    - os: macos
+                      arch: arm64
+                      runner: macos-latest
+        runs-on: ${{ matrix.platform.runner }}
+        name: "PHP Binary libraries — ${{ matrix.platform.os }} — ${{ matrix.platform.arch }}"
+        steps:
+            -   name: Checkout extension
+                uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+                with:
+                    ref: ${{ env.RELEASE_REF }}
+
+            -   name: Install build dependencies
+                if: matrix.platform.os == 'linux'
+                run: sudo apt-get update -qq && sudo apt-get install -y -qq re2c gettext
+
+            # StaticPHP runs on PHP 8.4+ with composer, which the macOS runners lack
+            -   name: Setup PHP to run StaticPHP
+                if: matrix.platform.os == 'macos'
+                uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+                with:
+                    php-version: '8.5'
+                    coverage: none
+                    tools: composer
+
+            # Downloads the library sources and writes what decides the build
+            # (StaticPHP's commit, the target, each library's version and hash)
+            # to staticphp-libs.key, the cache key below
+            -   name: Resolve the libraries
+                env:
+                    # StaticPHP looks up its library sources through the GitHub API
+                    GITHUB_TOKEN: ${{ github.token }}
+                run: sh .github/scripts/build-interpreter.sh libs-prepare staticphp-libs.key
+
+            # Only pull request runs, which publish nothing, use cached libraries.
+            # Release runs always build them: the key is predictable and a built
+            # archive cannot be verified, so anything able to write to the default
+            # branch's cache scope could otherwise plant libraries in a release.
+            # A new release of any library changes the key, so the cache never
+            # serves outdated libraries.
+            -   name: Restore cached libraries
+                id: cache
+                if: github.event_name == 'pull_request'
+                uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+                with:
+                    path: ${{ runner.temp }}/staticphp-libs.tar.gz
+                    key: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-${{ hashFiles('staticphp-libs.key') }}
+
+            -   name: Build the libraries
+                if: steps.cache.outputs.cache-hit != 'true'
+                env:
+                    GITHUB_TOKEN: ${{ github.token }}
+                run: sh .github/scripts/build-interpreter.sh libs-build "$RUNNER_TEMP/staticphp-libs.tar.gz"
+
+            # Release runs save what they built, for pull request runs to use
+            -   name: Save the libraries for pull requests
+                if: github.event_name != 'pull_request'
+                uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+                with:
+                    path: ${{ runner.temp }}/staticphp-libs.tar.gz
+                    key: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-${{ hashFiles('staticphp-libs.key') }}
+
+            -   name: Upload libraries
+                uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+                with:
+                    # Not release--*: only shared between jobs, never published
+                    name: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
+                    path: ${{ runner.temp }}/staticphp-libs.tar.gz
+                    retention-days: 1
 
     build-macos:
         needs: prepare
@@ -132,12 +225,12 @@ jobs:
         runs-on: macos-latest
         name: "MacOS — PHP ${{ matrix.php-version }} — arm64 — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
         steps:
-            -   uses: actions/checkout@v7
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
                 with:
                     ref: ${{ env.RELEASE_REF }}
 
             -   name: Setup PHP
-                uses: shivammathur/setup-php@v2
+                uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
                 with:
                     php-version: ${{ matrix.php-version }}
                     coverage: none
@@ -169,7 +262,7 @@ jobs:
                     zip -j "dist/php_php_debugger-${RELEASE_VERSION}_php${PHP_VER}-arm64-darwin-bsdlibc-${{ matrix.ts == 'ts' && 'zts' || 'nts' }}.zip" modules/php_debugger.so
 
             -   name: Upload artifact
-                uses: actions/upload-artifact@v7
+                uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
                 with:
                     name: release--macos-${{ matrix.php-version }}-${{ matrix.ts }}
                     path: dist/
@@ -194,13 +287,13 @@ jobs:
         runs-on: ${{ matrix.arch.runner }}
         name: "Linux — PHP ${{ matrix.php-version }} — ${{ matrix.arch.arch }} — ${{ matrix.libc }} — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
         steps:
-            -   uses: actions/checkout@v7
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
                 with:
                     ref: ${{ env.RELEASE_REF }}
 
             # The pinned zig (see setup-zig.sh), kept between runs
             -   name: Cache zig
-                uses: actions/cache@v6
+                uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
                 with:
                     path: ${{ runner.temp }}/zig-cache
                     key: zig-${{ runner.arch }}-${{ hashFiles('.github/scripts/setup-zig.sh') }}
@@ -276,7 +369,7 @@ jobs:
                     fi
 
             -   name: Upload artifact
-                uses: actions/upload-artifact@v7
+                uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
                 with:
                     name: release--linux-${{ matrix.php-version }}-${{ matrix.ts }}-${{ matrix.arch.arch }}-${{ matrix.libc }}
                     path: dist/
@@ -295,12 +388,12 @@ jobs:
         runs-on: ${{ contains(fromJSON('["8.2", "8.3", "8.4", "8.5"]'), matrix.php-version) && 'windows-2022' || 'windows-2025-vs2026' }}
         name: "Windows — PHP ${{ matrix.php-version }} — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
         steps:
-            -   uses: actions/checkout@v7
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
                 with:
                     ref: ${{ env.RELEASE_REF }}
 
             -   name: Build the extension
-                uses: php/php-windows-builder/extension@v1
+                uses: php/php-windows-builder/extension@227d3cb94e4fd9e9ab9459020df2394ee9a00eb4 # 1.10.0
                 with:
                     php-version: ${{ matrix.php-version }}
                     arch: x64
@@ -331,100 +424,10 @@ jobs:
                     Copy-Item $dll.FullName -Destination "dist\php_php-debugger-php${{ matrix.php-version }}-${{ matrix.ts }}-windows-x64.dll"
 
             -   name: Upload artifact
-                uses: actions/upload-artifact@v7
+                uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
                 with:
                     name: release--windows-${{ matrix.php-version }}-${{ matrix.ts }}
                     path: dist/
-
-    # The standalone Linux and macOS interpreters are built with StaticPHP, see
-    # .github/scripts/build-interpreter.sh: every library is linked in
-    # statically, so they run without anything installed (Linux: glibc
-    # MAX_GLIBC or newer; macOS: MIN_MACOS or newer) and can still load shared
-    # extensions.
-    #
-    # The libraries depend only on the platform, not on the PHP version or
-    # thread safety, so they are built once per platform here and shared by
-    # the build-php-unix jobs.
-    build-php-libs:
-        needs: prepare
-        strategy:
-            fail-fast: false
-            matrix:
-                platform:
-                    - os: linux
-                      arch: x86_64
-                      runner: ubuntu-26.04
-                    - os: linux
-                      arch: arm64
-                      runner: ubuntu-26.04-arm
-                    - os: macos
-                      arch: arm64
-                      runner: macos-latest
-        runs-on: ${{ matrix.platform.runner }}
-        name: "PHP Binary libraries — ${{ matrix.platform.os }} — ${{ matrix.platform.arch }}"
-        steps:
-            -   name: Checkout extension
-                uses: actions/checkout@v7
-                with:
-                    ref: ${{ env.RELEASE_REF }}
-
-            -   name: Install build dependencies
-                if: matrix.platform.os == 'linux'
-                run: sudo apt-get update -qq && sudo apt-get install -y -qq re2c gettext
-
-            # StaticPHP runs on PHP 8.4+ with composer, which the macOS runners lack
-            -   name: Setup PHP to run StaticPHP
-                if: matrix.platform.os == 'macos'
-                uses: shivammathur/setup-php@v2
-                with:
-                    php-version: '8.5'
-                    coverage: none
-                    tools: composer
-
-            # Downloads the library sources and writes what decides the build
-            # (StaticPHP's commit, the target, each library's version and hash)
-            # to staticphp-libs.key, the cache key below
-            -   name: Resolve the libraries
-                env:
-                    # StaticPHP looks up its library sources through the GitHub API
-                    GITHUB_TOKEN: ${{ github.token }}
-                run: sh .github/scripts/build-interpreter.sh libs-prepare staticphp-libs.key
-
-            # Only pull request runs, which publish nothing, use cached libraries.
-            # Release runs always build them: the key is predictable and a built
-            # archive cannot be verified, so anything able to write to the default
-            # branch's cache scope could otherwise plant libraries in a release.
-            # A new release of any library changes the key, so the cache never
-            # serves outdated libraries.
-            -   name: Restore cached libraries
-                id: cache
-                if: github.event_name == 'pull_request'
-                uses: actions/cache/restore@v6
-                with:
-                    path: ${{ runner.temp }}/staticphp-libs.tar.gz
-                    key: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-${{ hashFiles('staticphp-libs.key') }}
-
-            -   name: Build the libraries
-                if: steps.cache.outputs.cache-hit != 'true'
-                env:
-                    GITHUB_TOKEN: ${{ github.token }}
-                run: sh .github/scripts/build-interpreter.sh libs-build "$RUNNER_TEMP/staticphp-libs.tar.gz"
-
-            # Release runs save what they built, for pull request runs to use
-            -   name: Save the libraries for pull requests
-                if: github.event_name != 'pull_request'
-                uses: actions/cache/save@v6
-                with:
-                    path: ${{ runner.temp }}/staticphp-libs.tar.gz
-                    key: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-${{ hashFiles('staticphp-libs.key') }}
-
-            -   name: Upload libraries
-                uses: actions/upload-artifact@v7
-                with:
-                    # Not release--*: only shared between jobs, never published
-                    name: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
-                    path: ${{ runner.temp }}/staticphp-libs.tar.gz
-                    retention-days: 1
 
     build-php-unix:
         needs: [prepare, build-php-libs]
@@ -451,7 +454,7 @@ jobs:
             BINARY: php-php${{ matrix.php-version }}-${{ matrix.ts }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
         steps:
             -   name: Checkout extension
-                uses: actions/checkout@v7
+                uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
                 with:
                     ref: ${{ env.RELEASE_REF }}
 
@@ -462,14 +465,14 @@ jobs:
             # StaticPHP runs on PHP 8.4+ with composer, which the macOS runners lack
             -   name: Setup PHP to run StaticPHP
                 if: matrix.platform.os == 'macos'
-                uses: shivammathur/setup-php@v2
+                uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
                 with:
                     php-version: '8.5'
                     coverage: none
                     tools: composer
 
             -   name: Download the libraries
-                uses: actions/download-artifact@v8
+                uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
                 with:
                     name: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
                     path: ${{ runner.temp }}
@@ -507,7 +510,7 @@ jobs:
                     done
 
             -   name: Upload artifact
-                uses: actions/upload-artifact@v7
+                uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
                 with:
                     name: release--${{ env.BINARY }}
                     path: dist/
@@ -543,13 +546,13 @@ jobs:
         name: "PHP Binary Windows — PHP ${{ matrix.php-version }} — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
         steps:
             -   name: Checkout extension
-                uses: actions/checkout@v7
+                uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
                 with:
                     ref: ${{ env.RELEASE_REF }}
                     path: ext-src
 
             -   name: Checkout php-windows-builder
-                uses: actions/checkout@v7
+                uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
                 with:
                     repository: php/php-windows-builder
                     # v1 (1.10.0), pinned: the steps below patch files inside it. Needs
@@ -687,7 +690,7 @@ jobs:
                     if ($LASTEXITCODE -ne 0) { Write-Error "bundle checks failed"; exit 1 }
 
             -   name: Upload artifact
-                uses: actions/upload-artifact@v7
+                uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
                 with:
                     # release.yml publishes artifacts named release--*
                     name: release--${{ steps.package.outputs.asset_name }}
@@ -701,7 +704,7 @@ jobs:
             contents: write
             actions: write
         steps:
-            -   uses: actions/checkout@v7
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
                 with:
                     ref: ${{ env.RELEASE_REF }}
 
@@ -709,7 +712,7 @@ jobs:
             # artifact named release--*. Other artifacts in the run, such as
             # php-windows-builder's own uploads, are left out.
             -   name: Download release assets
-                uses: actions/download-artifact@v8
+                uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
                 with:
                     pattern: release--*
                     merge-multiple: true
@@ -719,7 +722,7 @@ jobs:
                 run: ls -la release-assets/
 
             -   name: Create release
-                uses: softprops/action-gh-release@v3
+                uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
                 with:
                     # on a `push` trigger this is inferred from GITHUB_REF; on
                     # workflow_dispatch GITHUB_REF is the branch picked in the
