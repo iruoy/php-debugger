@@ -47,28 +47,10 @@ env:
     # Debian 12 and Ubuntu 22.04 are newer). The build fails if a binary needs more.
     MAX_GLIBC: '2.34'
 
-    # Configure flags for the macOS interpreter build (JIT disabled - incompatible with
-    # php-debugger). The PIC flag is not here: its spelling depends on the PHP version,
-    # see PIC_FLAG in the build step. The Linux interpreter is built with StaticPHP,
-    # see .github/scripts/build-linux-interpreter.sh.
-    CONFIGURE_FLAGS: >-
-      --with-mhash
-      --enable-mbstring
-      --enable-mysqlnd
-      --with-password-argon2
-      --with-sodium=shared
-      --with-openssl
-      --with-zlib
-      --disable-phpdbg
-      --enable-opcache
-      --disable-opcache-jit
-      --enable-php-debugger
-
-    # macOS-specific flags (iconv path is set dynamically from SDK, using system sqlite and curl)
-    MACOS_FLAGS: --with-pdo-sqlite --with-sqlite3 --without-readline --with-curl
-
 
 jobs:
+    # Checks the tag, then resolves what every build job needs.
+    #
     # A `push: tags` run always has a real, already-existing tag (RELEASE_REF
     # is just github.ref_name). A manual workflow_dispatch run instead takes
     # the tag as free-text UI/API input, so it gets stricter treatment: format
@@ -77,8 +59,19 @@ jobs:
     # against the remote before the full build matrix fans out, so a typo
     # fails in seconds instead of burning a whole matrix of runner minutes on
     # every job's checkout.
-    validate-tag:
+    #
+    # The PHP versions and their sources are resolved once, so all platforms in
+    # a release build the same PHP patch versions: the latest php.net release
+    # tarball of each version, or its current pre-release before the first
+    # stable release (see .github/scripts/resolve-php-sources.py, which also
+    # holds the list of PHP versions). The build matrices take their versions
+    # from php-versions; jobs read their source with
+    # fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].
+    prepare:
         runs-on: ubuntu-latest
+        outputs:
+            php-versions: ${{ steps.resolve.outputs.php-versions }}
+            php-sources: ${{ steps.resolve.outputs.php-sources }}
         steps:
             -   name: Validate tag
                 env:
@@ -96,38 +89,24 @@ jobs:
                         exit 1
                     fi
 
-    # The PHP source every job builds against, resolved once so all platforms
-    # in a release use the same PHP patch versions: the latest php.net release
-    # tarball of each version, or its current pre-release before the first
-    # stable release. Jobs read their entry with
-    # fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].
-    resolve-php-versions:
-        runs-on: ubuntu-latest
-        outputs:
-            php-sources: ${{ steps.resolve.outputs.php-sources }}
-        steps:
             -   uses: actions/checkout@v7
                 with:
                     ref: ${{ env.RELEASE_REF }}
                     sparse-checkout: .github/scripts
 
-            -   name: Resolve PHP sources
+            -   name: Resolve PHP versions and sources
                 id: resolve
                 run: |
-                    SOURCES=$(python3 .github/scripts/resolve-php-sources.py 8.2 8.3 8.4 8.5 8.6)
+                    SOURCES=$(python3 .github/scripts/resolve-php-sources.py)
                     echo "php-sources=${SOURCES}" >> "$GITHUB_OUTPUT"
+                    echo "php-versions=$(echo "$SOURCES" | python3 -c 'import json, sys; print(json.dumps(list(json.load(sys.stdin))))')" >> "$GITHUB_OUTPUT"
 
     build-macos:
-        needs: validate-tag
+        needs: prepare
         strategy:
             fail-fast: false
             matrix:
-                php-version:
-                    - '8.2'
-                    - '8.3'
-                    - '8.4'
-                    - '8.5'
-                    - '8.6'
+                php-version: ${{ fromJSON(needs.prepare.outputs.php-versions) }}
                 ts:
                     - nts
                     - ts
@@ -153,17 +132,12 @@ jobs:
                     ./configure --enable-php-debugger
                     make -j$(sysctl -n hw.logicalcpu 2>/dev/null || nproc)
 
-            -   name: Verify extension loads
+            # Loads, and a debug client can attach and drive a script (DBGp smoke test)
+            -   name: Test extension
                 run: |
-                    php -dzend_extension=$PWD/modules/php_debugger.so -v
-                    php -dzend_extension=$PWD/modules/php_debugger.so -r "echo 'xdebug_info() works: ' . (function_exists('xdebug_info') ? 'yes' : 'no') . PHP_EOL;"
-
-            -   name: Smoke test (DBGp)
-                run: |
-                    TEST_PHP_ARGS="-n -dzend_extension=$PWD/modules/php_debugger.so"
-                    echo "TEST_PHP_ARGS=$TEST_PHP_ARGS" >> $GITHUB_ENV
-                    export TEST_PHP_ARGS
-                    php -n run-xdebug-tests.php -q tests/debugger/bug00530.phpt
+                    php -n -d zend_extension="$PWD/modules/php_debugger.so" -v
+                    TEST_PHP_ARGS="-n -d zend_extension=$PWD/modules/php_debugger.so" \
+                      php -n run-xdebug-tests.php -q tests/debugger/bug00530.phpt
 
             -   name: Package artifact
                 run: |
@@ -182,16 +156,11 @@ jobs:
                     path: dist/
 
     build-linux:
-        needs: [validate-tag, resolve-php-versions]
+        needs: prepare
         strategy:
             fail-fast: false
             matrix:
-                php-version:
-                    - '8.2'
-                    - '8.3'
-                    - '8.4'
-                    - '8.5'
-                    - '8.6'
+                php-version: ${{ fromJSON(needs.prepare.outputs.php-versions) }}
                 ts:
                     - nts
                     - ts
@@ -223,8 +192,8 @@ jobs:
             -   name: Build extension
                 env:
                     ZIG_CACHE_DIR: ${{ runner.temp }}/zig-cache
-                    PHP_URL: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].url }}
-                    PHP_SHA256: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].sha256 }}
+                    PHP_URL: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].url }}
+                    PHP_SHA256: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].sha256 }}
                     TARGET: ${{ matrix.arch.arch == 'arm64' && 'aarch64' || 'x86_64' }}-linux-${{ matrix.libc == 'glibc' && format('gnu.{0}', env.MAX_GLIBC) || 'musl' }}
                 run: sh .github/scripts/build-linux-binary.sh "$PHP_URL" "$PHP_SHA256" "${{ matrix.ts }}" "$TARGET" . "$RUNNER_TEMP/out"
 
@@ -253,14 +222,16 @@ jobs:
                     '
 
             # The runner cannot run a musl PHP, so test in the official Alpine image
-            # of the same version and thread safety. There is none for NTS 8.6: from
-            # 8.6 on the official images are ZTS only.
+            # of the same version and thread safety. There is none for NTS 8.6+:
+            # from 8.6 on the official images are ZTS only (and -zts is gone).
             -   name: Test in Alpine
-                if: matrix.libc == 'musl' && (matrix.ts == 'ts' || matrix.php-version != '8.6')
+                if: matrix.libc == 'musl' && (matrix.ts == 'ts' || contains(fromJSON('["8.2", "8.3", "8.4", "8.5"]'), matrix.php-version))
                 run: |
-                    if [ "${{ matrix.ts }}" = nts ]; then IMAGE="php:${{ matrix.php-version }}-cli-alpine"
-                    elif [ "${{ matrix.php-version }}" = 8.6 ]; then IMAGE="php:8.6-cli-alpine"
-                    else IMAGE="php:${{ matrix.php-version }}-zts-alpine"; fi
+                    case "${{ matrix.ts }}-${{ matrix.php-version }}" in
+                        nts-*) IMAGE="php:${{ matrix.php-version }}-cli-alpine" ;;
+                        ts-8.[2-5]) IMAGE="php:${{ matrix.php-version }}-zts-alpine" ;;
+                        *) IMAGE="php:${{ matrix.php-version }}-cli-alpine" ;;
+                    esac
                     docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/out:/out:ro" "$IMAGE" sh -euc '
                         cp -r /src /tmp/src && cd /tmp/src
                         PHP=$(command -v php)
@@ -292,21 +263,17 @@ jobs:
                     path: dist/
 
     build-windows:
-        needs: validate-tag
+        needs: prepare
         strategy:
             fail-fast: false
             matrix:
-                php-version:
-                    - '8.2'
-                    - '8.3'
-                    - '8.4'
-                    - '8.5'
-                    - '8.6'
+                php-version: ${{ fromJSON(needs.prepare.outputs.php-versions) }}
                 ts:
                   - nts
                   - ts
-        # PHP 8.6 is built with VS 2026, which only the windows-2025-vs2026 image has
-        runs-on: ${{ matrix.php-version == '8.6' && 'windows-2025-vs2026' || 'windows-2022' }}
+        # PHP 8.6 and later are built with VS 2026, which only the
+        # windows-2025-vs2026 image has
+        runs-on: ${{ contains(fromJSON('["8.2", "8.3", "8.4", "8.5"]'), matrix.php-version) && 'windows-2022' || 'windows-2025-vs2026' }}
         name: "Windows — PHP ${{ matrix.php-version }} — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
         steps:
             -   uses: actions/checkout@v7
@@ -351,21 +318,35 @@ jobs:
                     path: dist/
 
     build-php-macos:
-        needs: [validate-tag, resolve-php-versions]
+        needs: prepare
         strategy:
             fail-fast: false
             matrix:
-                php-version:
-                    - '8.2'
-                    - '8.3'
-                    - '8.4'
-                    - '8.5'
-                    - '8.6'
+                php-version: ${{ fromJSON(needs.prepare.outputs.php-versions) }}
                 ts:
                     - nts
                     - ts
         runs-on: macos-latest
         name: "PHP Binary MacOS — PHP ${{ matrix.php-version }} — arm64 — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
+        env:
+            # JIT disabled: incompatible with php-debugger. The PIC flag is not here:
+            # its spelling depends on the PHP version, see PIC_FLAG in the build step.
+            # (The Linux interpreter is built with StaticPHP, see
+            # .github/scripts/build-linux-interpreter.sh.)
+            CONFIGURE_FLAGS: >-
+              --with-mhash
+              --enable-mbstring
+              --enable-mysqlnd
+              --with-password-argon2
+              --with-sodium=shared
+              --with-openssl
+              --with-zlib
+              --disable-phpdbg
+              --enable-opcache
+              --disable-opcache-jit
+              --enable-php-debugger
+            # iconv path is set from the SDK in the build step; system sqlite and curl
+            MACOS_FLAGS: --with-pdo-sqlite --with-sqlite3 --without-readline --with-curl
         steps:
             -   name: Checkout extension
                 uses: actions/checkout@v7
@@ -378,14 +359,12 @@ jobs:
                     brew install autoconf automake libtool pkg-config \
                       openssl@3 argon2 oniguruma libsodium
 
-            -   name: Fetch PHP source
+            -   name: Fetch PHP source and add the extension
                 env:
-                    PHP_URL: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].url }}
-                    PHP_SHA256: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].sha256 }}
-                run: sh ext-src/.github/scripts/fetch-php-source.sh "$PHP_URL" "$PHP_SHA256" ~/php-src
-
-            -   name: Copy extension into php-src
+                    PHP_URL: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].url }}
+                    PHP_SHA256: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].sha256 }}
                 run: |
+                    sh ext-src/.github/scripts/fetch-php-source.sh "$PHP_URL" "$PHP_SHA256" ~/php-src
                     cp -r ext-src ~/php-src/ext/php_debugger
                     mkdir -p ~/php-src/m4
                     cp ext-src/m4/*.m4 ~/php-src/m4/
@@ -444,16 +423,11 @@ jobs:
                     # $(PHP) is empty: see the vm.gen.intermediate rule in Zend/Makefile.frag.
                     make -j$(sysctl -n hw.logicalcpu) PHP=
 
-            -   name: Verify extension is statically linked
+            # The debugger is compiled in, with its functions and INI settings
+            -   name: Test the interpreter
                 run: |
-                    cd ~/php-src
-                    ./sapi/cli/php -m | grep -q php_debugger
-                    ./sapi/cli/php -v | grep -q "PHP Debugger"
-
-            -   name: Test extension functionality
-                run: |
-                    cd ~/php-src
-                    ./sapi/cli/php -r "
+                    ~/php-src/sapi/cli/php -v | grep -q "PHP Debugger"
+                    ~/php-src/sapi/cli/php -r "
                       assert(extension_loaded('php_debugger'), 'php_debugger not loaded');
                       assert(function_exists('xdebug_break'), 'xdebug_break missing');
                       assert(function_exists('xdebug_info'), 'xdebug_info missing');
@@ -464,30 +438,22 @@ jobs:
                     "
 
             -   name: Package artifact
-                id: package
                 run: |
-                    cd ~/php-src
-                    PHP_VER="${{ matrix.php-version }}"
-                    OS_TAG="macos"
-                    ARCH_TAG="arm64"
-                    TS_TAG="${{ matrix.ts }}"
-                    ASSET_NAME="php-php${PHP_VER}-${TS_TAG}-${OS_TAG}-${ARCH_TAG}"
-                    cp sapi/cli/php "${ASSET_NAME}"
-                    chmod +x "${ASSET_NAME}"
-                    echo "asset_name=${ASSET_NAME}" >> $GITHUB_OUTPUT
-                    echo "asset_path=${HOME}/php-src/${ASSET_NAME}" >> $GITHUB_OUTPUT
+                    mkdir dist
+                    cp ~/php-src/sapi/cli/php "dist/php-php${{ matrix.php-version }}-${{ matrix.ts }}-macos-arm64"
+                    chmod +x dist/*
 
             -   name: Upload artifact
                 uses: actions/upload-artifact@v7
                 with:
-                    name: release--${{ steps.package.outputs.asset_name }}
-                    path: ${{ steps.package.outputs.asset_path }}
+                    name: release--php-php${{ matrix.php-version }}-${{ matrix.ts }}-macos-arm64
+                    path: dist/
 
     # The libraries the Linux interpreters link in statically depend only on the
     # architecture, not on the PHP version or thread safety, so they are built
     # once per architecture here and shared by the build-php-linux jobs.
     build-php-linux-libs:
-        needs: validate-tag
+        needs: prepare
         strategy:
             fail-fast: false
             matrix:
@@ -522,16 +488,11 @@ jobs:
                     retention-days: 1
 
     build-php-linux:
-        needs: [validate-tag, resolve-php-versions, build-php-linux-libs]
+        needs: [prepare, build-php-linux-libs]
         strategy:
             fail-fast: false
             matrix:
-                php-version:
-                    - '8.2'
-                    - '8.3'
-                    - '8.4'
-                    - '8.5'
-                    - '8.6'
+                php-version: ${{ fromJSON(needs.prepare.outputs.php-versions) }}
                 ts:
                     - nts
                     - ts
@@ -564,8 +525,8 @@ jobs:
 
             -   name: Build PHP with static php_debugger
                 env:
-                    PHP_URL: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].url }}
-                    PHP_SHA256: ${{ fromJSON(needs.resolve-php-versions.outputs.php-sources)[matrix.php-version].sha256 }}
+                    PHP_URL: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].url }}
+                    PHP_SHA256: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].sha256 }}
                     # StaticPHP looks up its library sources through the GitHub API
                     GITHUB_TOKEN: ${{ github.token }}
                 run: |
@@ -601,13 +562,13 @@ jobs:
     # Lives in its own reusable workflow so pull requests that change it are
     # built and tested on Windows runners without cutting a release.
     build-php-windows:
-        needs: [validate-tag, resolve-php-versions]
+        needs: prepare
         uses: ./.github/workflows/build-php-windows.yml
         with:
             # Same value as env.RELEASE_REF, which is not available in with: when
             # calling a reusable workflow, so the expression is repeated here.
             ref: ${{ github.event.inputs.tag || github.ref_name }}
-            php-sources: ${{ needs.resolve-php-versions.outputs.php-sources }}
+            php-sources: ${{ needs.prepare.outputs.php-sources }}
 
     release:
         needs: [build-macos, build-linux, build-windows, build-php-macos, build-php-linux, build-php-windows]

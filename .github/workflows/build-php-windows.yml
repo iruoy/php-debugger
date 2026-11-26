@@ -49,6 +49,7 @@ jobs:
     resolve:
         runs-on: ubuntu-latest
         outputs:
+            php-versions: ${{ steps.resolve.outputs.php-versions }}
             php-sources: ${{ steps.resolve.outputs.php-sources }}
         steps:
             -   uses: actions/checkout@v7
@@ -65,26 +66,23 @@ jobs:
                     if [ -n "$FROM_CALLER" ]; then
                         SOURCES="$FROM_CALLER"
                     else
-                        SOURCES=$(python3 .github/scripts/resolve-php-sources.py 8.2 8.3 8.4 8.5 8.6)
+                        SOURCES=$(python3 .github/scripts/resolve-php-sources.py)
                     fi
                     echo "php-sources=${SOURCES}" >> "$GITHUB_OUTPUT"
+                    # The PHP versions to build: the keys of the sources
+                    echo "php-versions=$(echo "$SOURCES" | python3 -c 'import json, sys; print(json.dumps(list(json.load(sys.stdin))))')" >> "$GITHUB_OUTPUT"
 
     build:
         needs: resolve
         strategy:
             fail-fast: false
             matrix:
-                php-version:
-                    - '8.2'
-                    - '8.3'
-                    - '8.4'
-                    - '8.5'
-                    - '8.6'
+                php-version: ${{ fromJSON(needs.resolve.outputs.php-versions) }}
                 ts:
                     - nts
                     - ts
-        # VS 2026 (needed for PHP 8.6) is only on the windows-2025-vs2026 image
-        runs-on: ${{ matrix.php-version == '8.6' && 'windows-2025-vs2026' || 'windows-2022' }}
+        # VS 2026 (needed for PHP 8.6 and later) is only on the windows-2025-vs2026 image
+        runs-on: ${{ contains(fromJSON('["8.2", "8.3", "8.4", "8.5"]'), matrix.php-version) && 'windows-2022' || 'windows-2025-vs2026' }}
         name: "PHP Binary Windows — PHP ${{ matrix.php-version }} — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
         steps:
             -   name: Checkout extension

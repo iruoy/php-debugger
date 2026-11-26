@@ -6,14 +6,20 @@ releases API or, for a version without a stable release yet, its current
 pre-release (alpha, beta or RC) from the php.net pre-release API. It fails
 when php.net has neither.
 
-Prints one JSON object, which the release jobs index by matrix.php-version:
+Prints one JSON object, which the release jobs index by matrix.php-version
+(and whose keys are the PHP versions the release builds for):
   {"8.4": {"version": "8.4.28", "url": "https://...tar.xz", "sha256": "..."}, ...}
 
-Usage: resolve-php-sources.py 8.2 8.3 8.4 ...
+Usage: resolve-php-sources.py [8.2 8.3 ...]   (default: PHP_VERSIONS below)
 """
 import json
 import sys
 import urllib.request
+
+# The PHP versions the release builds for: the one list the release workflow's
+# build matrices and build-php-windows.yml take theirs from. Keep it in line
+# with the PHP version check in config.m4 and "php" in composer.json.
+PHP_VERSIONS = ["8.2", "8.3", "8.4", "8.5", "8.6"]
 
 
 def get_json(url):
@@ -53,7 +59,7 @@ def pre_release(minor, builds):
 
 sources = {}
 builds = None
-for minor in sys.argv[1:]:
+for minor in sys.argv[1:] or PHP_VERSIONS:
     source = stable(minor)
     if source is None:
         if builds is None:
