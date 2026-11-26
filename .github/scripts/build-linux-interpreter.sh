@@ -38,10 +38,11 @@ cd "$WORK"
 STATICPHP_COMMIT=4193678111e6841b434348d76c94feadf7086542
 curl -fsSL --retry 3 "https://github.com/crazywhalecc/static-php-cli/archive/${STATICPHP_COMMIT}.tar.gz" | tar -xz -C "$WORK"
 mv "$WORK/static-php-cli-${STATICPHP_COMMIT}" "$WORK/staticphp-src"
-# The runner's PHP (8.4+ needed) has Xdebug enabled, which only slows StaticPHP down
-export XDEBUG_MODE=off
-composer install --working-dir="$WORK/staticphp-src" --no-dev --no-interaction --no-progress --prefer-dist --quiet
-printf '#!/bin/sh\nexec php "%s/staticphp-src/bin/spc" "$@"\n' "$WORK" > "$WORK/bin/spc"
+# The runner's PHP (8.4+ needed) has Xdebug enabled, which only slows StaticPHP
+# down. XDEBUG_MODE is set for these commands only: php_debugger reads it too,
+# so exporting it would also switch the debugger off in the smoke test below.
+XDEBUG_MODE=off composer install --working-dir="$WORK/staticphp-src" --no-dev --no-interaction --no-progress --prefer-dist --quiet
+printf '#!/bin/sh\nXDEBUG_MODE=off exec php "%s/staticphp-src/bin/spc" "$@"\n' "$WORK" > "$WORK/bin/spc"
 chmod +x "$WORK/bin/spc"
 export PATH="$WORK/bin:$PATH"
 spc --version
