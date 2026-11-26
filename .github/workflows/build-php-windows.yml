@@ -232,7 +232,7 @@ jobs:
                     if ($LASTEXITCODE -ne 0) { Write-Error "bundle checks failed"; exit 1 }
 
             -   name: Upload artifact
-                uses: actions/upload-artifact@v6
+                uses: actions/upload-artifact@v7
                 with:
                     # release.yml publishes artifacts named release--*
                     name: release--${{ steps.package.outputs.asset_name }}

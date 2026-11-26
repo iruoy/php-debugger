@@ -176,7 +176,7 @@ jobs:
                     zip -j "dist/php_php_debugger-${RELEASE_REF}_php${PHP_VER}-arm64-darwin-bsdlibc-${{ matrix.ts == 'ts' && 'zts' || 'nts' }}.zip" modules/php_debugger.so
 
             -   name: Upload artifact
-                uses: actions/upload-artifact@v6
+                uses: actions/upload-artifact@v7
                 with:
                     name: release--macos-${{ matrix.php-version }}-${{ matrix.ts }}
                     path: dist/
@@ -286,7 +286,7 @@ jobs:
                     fi
 
             -   name: Upload artifact
-                uses: actions/upload-artifact@v6
+                uses: actions/upload-artifact@v7
                 with:
                     name: release--linux-${{ matrix.php-version }}-${{ matrix.ts }}-${{ matrix.arch.arch }}-${{ matrix.libc }}
                     path: dist/
@@ -345,7 +345,7 @@ jobs:
                     Copy-Item $dll.FullName -Destination "dist\php_php-debugger-php${{ matrix.php-version }}-${{ matrix.ts }}-windows-x64.dll"
 
             -   name: Upload artifact
-                uses: actions/upload-artifact@v6
+                uses: actions/upload-artifact@v7
                 with:
                     name: release--windows-${{ matrix.php-version }}-${{ matrix.ts }}
                     path: dist/
@@ -478,7 +478,7 @@ jobs:
                     echo "asset_path=${HOME}/php-src/${ASSET_NAME}" >> $GITHUB_OUTPUT
 
             -   name: Upload artifact
-                uses: actions/upload-artifact@v6
+                uses: actions/upload-artifact@v7
                 with:
                     name: release--${{ steps.package.outputs.asset_name }}
                     path: ${{ steps.package.outputs.asset_path }}
@@ -514,7 +514,7 @@ jobs:
                 run: sh .github/scripts/build-linux-interpreter.sh libs "$RUNNER_TEMP/staticphp-libs.tar.gz"
 
             -   name: Upload libraries
-                uses: actions/upload-artifact@v6
+                uses: actions/upload-artifact@v7
                 with:
                     # Not release--*: only shared between jobs, never published
                     name: staticphp-libs-${{ matrix.arch.arch }}
@@ -593,7 +593,7 @@ jobs:
                     done
 
             -   name: Upload artifact
-                uses: actions/upload-artifact@v6
+                uses: actions/upload-artifact@v7
                 with:
                     name: release--php-php${{ matrix.php-version }}-${{ matrix.ts }}-linux-${{ matrix.arch.arch }}
                     path: dist/
