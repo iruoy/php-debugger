@@ -7,9 +7,10 @@
 #
 # Afterwards, put <dir>/bin on PATH and use CC=zcc CXX=zcxx AR=zar RANLIB=zranlib.
 #
-# If ZIG_CACHE_DIR is set, zig is kept there (one directory per version and
-# architecture) and only downloaded when it is not there yet, e.g. when the
-# workflow restores that directory with actions/cache.
+# If ZIG_CACHE_DIR is set, the downloaded zig archive is kept there, e.g. for the
+# workflow to restore with actions/cache. The pinned checksum is checked on every
+# use, not only on download, so a cached archive that does not match is fetched
+# again instead of used.
 #
 # Usage: setup-zig.sh <zig target> <dir>
 set -eu
@@ -25,17 +26,19 @@ case "$(uname -m)" in
     *) echo "error: no zig for $(uname -m)" >&2; exit 1 ;;
 esac
 
-ZIG="${ZIG_CACHE_DIR:-$DIR}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}"
-if [ -x "$ZIG/zig" ]; then
-    echo "Using cached zig in $ZIG"
+ARCHIVE="${ZIG_CACHE_DIR:-$DIR}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
+mkdir -p "$(dirname "$ARCHIVE")"
+if [ -f "$ARCHIVE" ] && echo "$ZIG_SHA256  $ARCHIVE" | sha256sum -c --status -; then
+    echo "Using cached $ARCHIVE (checksum verified)"
 else
-    mkdir -p "$ZIG"
-    curl -fsSL --retry 3 -o "$ZIG.tar.xz" "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
-    echo "$ZIG_SHA256  $ZIG.tar.xz" | sha256sum -c -
-    tar -xJf "$ZIG.tar.xz" --strip-components=1 -C "$ZIG"
-    rm -f "$ZIG.tar.xz"
+    curl -fsSL --retry 3 -o "$ARCHIVE" "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
+    echo "$ZIG_SHA256  $ARCHIVE" | sha256sum -c -
 fi
-mkdir -p "$DIR/bin"
+ZIG="$DIR/zig"
+rm -rf "$ZIG"
+mkdir -p "$ZIG" "$DIR/bin"
+tar -xJf "$ARCHIVE" --strip-components=1 -C "$ZIG"
+[ -z "${ZIG_CACHE_DIR:-}" ] && rm -f "$ARCHIVE"
 
 # -fno-sanitize=all: zig enables UBSan unless optimizing, which must not end up
 # in release binaries (and aborts PHP 8.6's build-time JIT generators).
