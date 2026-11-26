@@ -497,12 +497,16 @@ jobs:
                     GITHUB_TOKEN: ${{ github.token }}
                 run: sh .github/scripts/build-linux-interpreter.sh libs-prepare staticphp-libs.key
 
+            # Only pull request runs, which publish nothing, use cached libraries.
+            # Release runs always build them: the key is predictable and a built
+            # archive cannot be verified, so anything able to write to the default
+            # branch's cache scope could otherwise plant libraries in a release.
             # A new release of any library changes the key, so the cache never
-            # serves outdated libraries. Caches are scoped to the branch that wrote
-            # them: a pull request run can read main's but not write to it.
-            -   name: Cache the libraries
+            # serves outdated libraries.
+            -   name: Restore cached libraries
                 id: cache
-                uses: actions/cache@v6
+                if: github.event_name == 'pull_request'
+                uses: actions/cache/restore@v6
                 with:
                     path: ${{ runner.temp }}/staticphp-libs.tar.gz
                     key: staticphp-libs-${{ matrix.arch.arch }}-${{ hashFiles('staticphp-libs.key') }}
@@ -512,6 +516,14 @@ jobs:
                 env:
                     GITHUB_TOKEN: ${{ github.token }}
                 run: sh .github/scripts/build-linux-interpreter.sh libs-build "$RUNNER_TEMP/staticphp-libs.tar.gz"
+
+            # Release runs save what they built, for pull request runs to use
+            -   name: Save the libraries for pull requests
+                if: github.event_name != 'pull_request'
+                uses: actions/cache/save@v6
+                with:
+                    path: ${{ runner.temp }}/staticphp-libs.tar.gz
+                    key: staticphp-libs-${{ matrix.arch.arch }}-${{ hashFiles('staticphp-libs.key') }}
 
             -   name: Upload libraries
                 uses: actions/upload-artifact@v7
