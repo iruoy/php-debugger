@@ -26,6 +26,7 @@
     "php-ext": {
         "extension-name": "php_debugger",
         "priority": 90,
+        "download-url-method": ["pre-packaged-binary", "composer-default"],
         "configure-options": [
             {
                 "name": "enable-php-debugger",
