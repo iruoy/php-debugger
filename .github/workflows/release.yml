@@ -55,14 +55,14 @@ env:
     # or a placeholder on a pull request.
     RELEASE_VERSION: ${{ github.event_name == 'pull_request' && format('0.0.0-pr{0}', github.event.number) || github.event.inputs.tag || github.ref_name }}
 
-    # The oldest glibc the Linux extensions run on: they are built with zig for
-    # this glibc version, whatever glibc the runner has. 2.34 is the oldest in
-    # supported distros used for development (RHEL 9; Debian 12 and Ubuntu 22.04
-    # are newer). The build fails if a binary needs more.
+    # The oldest glibc the Linux binaries (extensions and interpreters) run on:
+    # they are built with zig for this glibc version, whatever glibc the runner
+    # has. 2.34 is the oldest in supported distros used for development (RHEL 9;
+    # Debian 12 and Ubuntu 22.04 are newer). The build fails if a binary needs more.
     MAX_GLIBC: '2.34'
 
-    # The oldest macOS the macOS extensions run on (their deployment target);
-    # the build fails if a binary needs a newer one.
+    # The oldest macOS the standalone macOS interpreters run on (their deployment
+    # target, StaticPHP's default); the build fails if a binary needs a newer one.
     MIN_MACOS: '12.0'
 
     # Distributions with the oldest supported glibc (MAX_GLIBC), where the Linux
@@ -72,28 +72,6 @@ env:
     # Release assets are published by the release job, so the artifacts only
     # need to outlive the run (and its reruns)
     ARTIFACT_RETENTION_DAYS: 7
-
-    # Common configure flags for the Linux and macOS interpreters (JIT disabled - incompatible with php-debugger).
-    # The PIC flag is not here: its spelling depends on the PHP version, see PIC_FLAG
-    # in the build steps.
-    CONFIGURE_FLAGS: >-
-      --with-mhash
-      --enable-mbstring
-      --enable-mysqlnd
-      --with-password-argon2
-      --with-sodium=shared
-      --with-openssl
-      --with-zlib
-      --disable-phpdbg
-      --enable-opcache
-      --disable-opcache-jit
-      --enable-php-debugger
-
-    # macOS-specific flags (iconv path is set dynamically from SDK, using system sqlite and curl)
-    MACOS_FLAGS: --with-pdo-sqlite --with-sqlite3 --without-readline --with-curl
-
-    # Linux-specific flags
-    LINUX_FLAGS: --with-pdo-sqlite=/usr --with-sqlite3=/usr --with-iconv --with-readline --with-curl
 
 jobs:
     # Checks the tag, then resolves what every build job needs.
@@ -150,6 +128,109 @@ jobs:
                     SOURCES=$(python3 .github/scripts/resolve-php-sources.py)
                     echo "php-sources=${SOURCES}" >> "$GITHUB_OUTPUT"
                     echo "php-versions=$(echo "$SOURCES" | jq -c keys_unsorted)" >> "$GITHUB_OUTPUT"
+
+    # The standalone Linux and macOS interpreters are built with StaticPHP, see
+    # .github/scripts/build-interpreter.sh: every library is linked in
+    # statically, so they run without anything installed (Linux: glibc
+    # MAX_GLIBC or newer; macOS: MIN_MACOS or newer) and can still load shared
+    # extensions.
+    #
+    # The libraries depend only on the platform, not on the PHP version or
+    # thread safety, so they are built once per platform here and shared by
+    # the build-php-unix jobs. This job comes first in the file: jobs that are
+    # ready at the same time are queued roughly in file order, and this one is
+    # on the longest path (libraries, then interpreters), so it should get a
+    # runner before the many short extension builds fill them.
+    build-php-libs:
+        needs: prepare
+        strategy:
+            fail-fast: false
+            matrix:
+                platform:
+                    - os: linux
+                      arch: x86_64
+                      runner: ubuntu-26.04
+                    - os: linux
+                      arch: arm64
+                      runner: ubuntu-26.04-arm
+                    - os: macos
+                      arch: arm64
+                      runner: macos-latest
+        runs-on: ${{ matrix.platform.runner }}
+        name: "PHP Binary libraries — ${{ matrix.platform.os }} — ${{ matrix.platform.arch }}"
+        steps:
+            -   name: Checkout extension
+                uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+                with:
+                    ref: ${{ env.RELEASE_REF }}
+
+            -   name: Install build dependencies
+                if: matrix.platform.os == 'linux'
+                run: sudo apt-get update -qq && sudo apt-get install -y -qq re2c gettext
+
+            # StaticPHP runs on PHP 8.4+ with composer, which the macOS runners lack
+            -   name: Setup PHP to run StaticPHP
+                if: matrix.platform.os == 'macos'
+                uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+                with:
+                    php-version: '8.5'
+                    coverage: none
+                    tools: composer
+
+            # Downloads the library sources and writes what decides the build
+            # (StaticPHP's commit, the target, each library's version and hash)
+            # to staticphp-libs.key, whose hash is in the cache key
+            -   name: Resolve the libraries
+                id: libs
+                env:
+                    # StaticPHP looks up its library sources through the GitHub API
+                    GITHUB_TOKEN: ${{ github.token }}
+                run: |
+                    sh .github/scripts/build-interpreter.sh libs-prepare staticphp-libs.key
+                    echo "cache-key=staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-$(shasum -a 256 staticphp-libs.key | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+            # Only pull request runs, which publish nothing, use cached libraries.
+            # Release runs always build them: the key is predictable and a built
+            # archive cannot be verified, so anything able to write to the default
+            # branch's cache scope could otherwise plant libraries in a release.
+            # A new release of any library changes the key, so the cache never
+            # serves outdated libraries.
+            -   name: Restore cached libraries
+                id: cache
+                if: github.event_name == 'pull_request'
+                uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+                with:
+                    path: ${{ runner.temp }}/staticphp-libs.tar.gz
+                    key: ${{ steps.libs.outputs.cache-key }}
+
+            -   name: Build the libraries
+                if: steps.cache.outputs.cache-hit != 'true'
+                env:
+                    GITHUB_TOKEN: ${{ github.token }}
+                run: sh .github/scripts/build-interpreter.sh libs-build "$RUNNER_TEMP/staticphp-libs.tar.gz"
+
+            # Release runs save what they built, for pull request runs to use. Only
+            # runs on the default branch (prepare-release.yml dispatches from main)
+            # save to a cache scope pull requests can read; a run for a pushed tag
+            # could not share it.
+            -   name: Save the libraries for pull requests
+                if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+                uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+                with:
+                    path: ${{ runner.temp }}/staticphp-libs.tar.gz
+                    key: ${{ steps.libs.outputs.cache-key }}
+
+            -   name: Upload libraries
+                uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+                with:
+                    # Not release--*: only shared between jobs, never published
+                    name: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
+                    path: ${{ runner.temp }}/staticphp-libs.tar.gz
+                    # As long as the release assets: rerunning failed interpreter
+                    # jobs reuses this run's libraries
+                    retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+                    # Already a .tar.gz
+                    compression-level: 0
 
     build-macos:
         needs: prepare
@@ -386,8 +467,13 @@ jobs:
                     path: dist/
                     retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
-    build-php-macos:
-        needs: prepare
+    build-php-unix:
+        needs: [prepare, build-php-libs]
+        # Each job only uses its own platform's libraries (see "Download the
+        # libraries"), so it runs even if another platform's build-php-libs job
+        # failed, e.g. when no macOS runner was available; the release job still
+        # needs every build to succeed.
+        if: ${{ !cancelled() && needs.prepare.result == 'success' }}
         strategy:
             fail-fast: false
             matrix:
@@ -395,236 +481,93 @@ jobs:
                 ts:
                     - nts
                     - ts
-        runs-on: macos-latest
-        name: "PHP Binary MacOS — PHP ${{ matrix.php-version }} — arm64 — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
-        steps:
-            -   name: Checkout extension
-                uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-                with:
-                    ref: ${{ env.RELEASE_REF }}
-                    path: ext-src
-
-            -   name: Install build dependencies
-                run: |
-                    brew install autoconf automake libtool pkg-config \
-                      openssl@3 argon2 oniguruma libsodium
-
-            -   name: Fetch PHP source
-                env:
-                    PHP_URL: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].url }}
-                    PHP_SHA256: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].sha256 }}
-                run: sh ext-src/.github/scripts/fetch-php-source.sh "$PHP_URL" "$PHP_SHA256" ~/php-src
-
-            -   name: Copy extension into php-src
-                run: |
-                    cp -r ext-src ~/php-src/ext/php_debugger
-                    mkdir -p ~/php-src/m4
-                    cp ext-src/m4/*.m4 ~/php-src/m4/
-
-            -   name: Build PHP with static php_debugger
-                run: |
-                    cd ~/php-src
-
-                    # Get macOS SDK path for iconv headers
-                    SDK_PATH=$(xcrun --show-sdk-path)
-                    ICONV_PATH="${SDK_PATH}/usr"
-
-                    # Extract the actual PHP version from the source (from main/php_version.h)
-                    PHP_FULL_VERSION=$(grep 'PHP_VERSION ' main/php_version.h | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-                    PHP_MINOR_VERSION="${{ matrix.php-version }}"
-
-                    export PATH="/opt/homebrew/bin:$PATH"
-
-                    PREFIX="/opt/homebrew/Cellar/php@${PHP_MINOR_VERSION}/${PHP_FULL_VERSION}"
-                    LOCALSTATEDIR="/opt/homebrew/var"
-                    SYSCONFDIR="/opt/homebrew/etc/php/${PHP_MINOR_VERSION}"
-                    CONFIG_FILE_PATH="/opt/homebrew/etc/php/${PHP_MINOR_VERSION}"
-                    CONFIG_FILE_SCAN_DIR="/opt/homebrew/etc/php/${PHP_MINOR_VERSION}/conf.d"
-
-                    # Create directories if they don't exist
-                    sudo mkdir -p "${PREFIX}"
-                    sudo mkdir -p "${LOCALSTATEDIR}"
-                    sudo mkdir -p "${CONFIG_FILE_SCAN_DIR}"
-
-                    ./buildconf --force
-
-                    # PHP 8.6 bundles Libtool 2.5, which rejects --with-pic in favor of
-                    # --enable-pic; 8.2-8.5 bundle Libtool 1.5, which only knows --with-pic
-                    # (and would merely warn about --enable-pic, silently building without it).
-                    case "${{ matrix.php-version }}" in
-                        8.[2-5]) PIC_FLAG=--with-pic ;;
-                        *) PIC_FLAG=--enable-pic ;;
-                    esac
-
-                    ./configure \
-                      --prefix="${PREFIX}" \
-                      --localstatedir="${LOCALSTATEDIR}" \
-                      --sysconfdir="${SYSCONFDIR}" \
-                      --with-config-file-path="${CONFIG_FILE_PATH}" \
-                      --with-config-file-scan-dir="${CONFIG_FILE_SCAN_DIR}" \
-                      $CONFIGURE_FLAGS \
-                      $PIC_FLAG \
-                      $MACOS_FLAGS \
-                      --with-iconv="${ICONV_PATH}" \
-                      ${{ matrix.ts == 'ts' && '--enable-zts' || '' }}
-
-                    # PHP= keeps the Zend VM files generated in the release tag. Otherwise make
-                    # regenerates them with whatever php the runner has, and PHP 8.2's
-                    # generator writes a broken zend_vm_opcodes.h when that php defines
-                    # ZEND_VM_KIND itself (PHP 8.5 does). The regeneration is skipped when
-                    # $(PHP) is empty: see the vm.gen.intermediate rule in Zend/Makefile.frag.
-                    make -j$(sysctl -n hw.logicalcpu) PHP=
-
-            -   name: Verify extension is statically linked
-                run: |
-                    cd ~/php-src
-                    ./sapi/cli/php -m | grep -q php_debugger
-                    ./sapi/cli/php -v | grep -q "PHP Debugger"
-
-            -   name: Test extension functionality
-                run: |
-                    cd ~/php-src
-                    ./sapi/cli/php -r "
-                      assert(extension_loaded('php_debugger'), 'php_debugger not loaded');
-                      assert(function_exists('xdebug_break'), 'xdebug_break missing');
-                      assert(function_exists('xdebug_info'), 'xdebug_info missing');
-                      assert(function_exists('php_debugger_info'), 'php_debugger_info missing');
-                      assert(ini_get('xdebug.client_port') !== false, 'xdebug.* INI missing');
-                      assert(ini_get('php_debugger.client_port') !== false, 'php_debugger.* INI missing');
-                      echo 'All tests passed!' . PHP_EOL;
-                    "
-
-            -   name: Package artifact
-                id: package
-                run: |
-                    cd ~/php-src
-                    PHP_VER="${{ matrix.php-version }}"
-                    OS_TAG="macos"
-                    ARCH_TAG="arm64"
-                    TS_TAG="${{ matrix.ts }}"
-                    ASSET_NAME="php-php${PHP_VER}-${TS_TAG}-${OS_TAG}-${ARCH_TAG}"
-                    cp sapi/cli/php "${ASSET_NAME}"
-                    chmod +x "${ASSET_NAME}"
-                    echo "asset_name=${ASSET_NAME}" >> $GITHUB_OUTPUT
-                    echo "asset_path=${HOME}/php-src/${ASSET_NAME}" >> $GITHUB_OUTPUT
-
-            -   name: Upload artifact
-                uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-                with:
-                    name: release--${{ steps.package.outputs.asset_name }}
-                    path: ${{ steps.package.outputs.asset_path }}
-                    retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
-
-    build-php-linux:
-        needs: prepare
-        strategy:
-            fail-fast: false
-            matrix:
-                php-version: ${{ fromJSON(needs.prepare.outputs.php-versions) }}
-                ts:
-                    - nts
-                    - ts
-                arch:
-                    - runner: ubuntu-latest
+                platform:
+                    - os: linux
                       arch: x86_64
-                    - runner: ubuntu-24.04-arm
+                      runner: ubuntu-26.04
+                    - os: linux
                       arch: arm64
-        runs-on: ${{ matrix.arch.runner }}
-        name: "PHP Binary Linux — PHP ${{ matrix.php-version }} — ${{ matrix.arch.arch }} — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
+                      runner: ubuntu-26.04-arm
+                    - os: macos
+                      arch: arm64
+                      runner: macos-latest
+        runs-on: ${{ matrix.platform.runner }}
+        name: "PHP Binary ${{ matrix.platform.os }} — PHP ${{ matrix.php-version }} — ${{ matrix.platform.arch }} — ${{ matrix.ts == 'ts' && 'TS' || 'NTS' }}"
+        env:
+            BINARY: php-php${{ matrix.php-version }}-${{ matrix.ts }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
         steps:
             -   name: Checkout extension
                 uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
                 with:
                     ref: ${{ env.RELEASE_REF }}
-                    path: ext-src
 
             -   name: Install build dependencies
-                run: |
-                    sudo apt-get update
-                    sudo apt-get install -y autoconf automake libtool pkg-config \
-                      libxml2-dev libsqlite3-dev libcurl4-openssl-dev libssl-dev libreadline-dev \
-                      libsodium-dev libargon2-dev libonig-dev build-essential
+                if: matrix.platform.os == 'linux'
+                run: sudo apt-get update -qq && sudo apt-get install -y -qq re2c gettext
 
-            -   name: Fetch PHP source
+            # StaticPHP runs on PHP 8.4+ with composer, which the macOS runners lack
+            -   name: Setup PHP to run StaticPHP
+                if: matrix.platform.os == 'macos'
+                uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+                with:
+                    php-version: '8.5'
+                    coverage: none
+                    tools: composer
+
+            -   name: Download the libraries
+                uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+                with:
+                    name: staticphp-libs-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
+                    path: ${{ runner.temp }}
+
+            # Also checks the linked libraries, the glibc/macOS version, the
+            # extensions, and runs a DBGp smoke test
+            -   name: Build PHP with static php_debugger
                 env:
                     PHP_URL: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].url }}
                     PHP_SHA256: ${{ fromJSON(needs.prepare.outputs.php-sources)[matrix.php-version].sha256 }}
-                run: sh ext-src/.github/scripts/fetch-php-source.sh "$PHP_URL" "$PHP_SHA256" ~/php-src
-
-            -   name: Copy extension into php-src
+                    # StaticPHP looks up its library sources through the GitHub API
+                    GITHUB_TOKEN: ${{ github.token }}
                 run: |
-                    cp -r ext-src ~/php-src/ext/php_debugger
-                    mkdir -p ~/php-src/m4
-                    cp ext-src/m4/*.m4 ~/php-src/m4/
+                    mkdir -p dist
+                    sh .github/scripts/build-interpreter.sh php "$PHP_URL" "$PHP_SHA256" "${{ matrix.ts }}" . \
+                      "dist/$BINARY" "$RUNNER_TEMP/staticphp-libs.tar.gz"
 
-            -   name: Build PHP with static php_debugger
+            # On the oldest CPU model of the architecture, see the script
+            -   name: Check it runs on a baseline CPU
+                if: matrix.platform.os == 'linux'
+                run: sh .github/scripts/check-baseline-cpu.sh "dist/$BINARY" .
+
+            # Extensions from a distribution's PHP must load into the interpreter
+            # (php-debugger/installer keeps a replaced PHP's extensions), including
+            # ones that call PCRE2 by its standard names, like apcu. Debian 13
+            # packages PHP 8.4, so this runs in the matching jobs.
+            -   name: Check it loads Debian's packaged extensions
+                if: matrix.platform.os == 'linux' && matrix.php-version == '8.4' && matrix.ts == 'nts'
                 run: |
-                    cd ~/php-src
-                    ./buildconf --force
+                    docker run --rm -v "$PWD/dist:/dist:ro" debian:13-slim sh -euc '
+                        apt-get -qq update && apt-get -qq install -y php8.4-cli php8.4-apcu php8.4-imagick >/dev/null
+                        E=$(php -r "echo ini_get(\"extension_dir\");")
+                        "/dist/$0" -n -d "extension=$E/apcu.so" -d apc.enable_cli=1 \
+                          -r "apcu_store(\"k\", 42); if (apcu_fetch(\"k\") !== 42) exit(1); echo \"apcu works\n\";"
+                        "/dist/$0" -n -d "extension=$E/imagick.so" \
+                          -r "\$i = new Imagick(); \$i->newImage(2, 2, \"red\"); if (\$i->getImageWidth() !== 2) exit(1); echo \"imagick works\n\";"
+                    ' "$BINARY"
 
-                    # PHP 8.6 bundles Libtool 2.5, which rejects --with-pic in favor of
-                    # --enable-pic; 8.2-8.5 bundle Libtool 1.5, which only knows --with-pic
-                    # (and would merely warn about --enable-pic, silently building without it).
-                    case "${{ matrix.php-version }}" in
-                        8.[2-5]) PIC_FLAG=--with-pic ;;
-                        *) PIC_FLAG=--enable-pic ;;
-                    esac
-
-                    ./configure \
-                      --with-config-file-path=/usr/local/etc/php \
-                      --with-config-file-scan-dir=/usr/local/etc/php/conf.d \
-                      $CONFIGURE_FLAGS \
-                      $PIC_FLAG \
-                      $LINUX_FLAGS \
-                      ${{ matrix.ts == 'ts' && '--enable-zts' || '' }}
-                    # PHP= keeps the Zend VM files generated in the release tag. Otherwise make
-                    # regenerates them with whatever php the runner has, and PHP 8.2's
-                    # generator writes a broken zend_vm_opcodes.h when that php defines
-                    # ZEND_VM_KIND itself (PHP 8.5 does). The regeneration is skipped when
-                    # $(PHP) is empty: see the vm.gen.intermediate rule in Zend/Makefile.frag.
-                    make -j$(nproc) PHP=
-
-            -   name: Verify extension is statically linked
+            -   name: Check it runs on other distros
+                if: matrix.platform.os == 'linux'
                 run: |
-                    cd ~/php-src
-                    ./sapi/cli/php -m | grep -q php_debugger
-                    ./sapi/cli/php -v | grep -q "PHP Debugger"
-
-            -   name: Test extension functionality
-                run: |
-                    cd ~/php-src
-                    ./sapi/cli/php -r "
-                      assert(extension_loaded('php_debugger'), 'php_debugger not loaded');
-                      assert(function_exists('xdebug_break'), 'xdebug_break missing');
-                      assert(function_exists('xdebug_info'), 'xdebug_info missing');
-                      assert(function_exists('php_debugger_info'), 'php_debugger_info missing');
-                      assert(ini_get('xdebug.client_port') !== false, 'xdebug.* INI missing');
-                      assert(ini_get('php_debugger.client_port') !== false, 'php_debugger.* INI missing');
-                      echo 'All tests passed!' . PHP_EOL;
-                    "
-
-            -   name: Package artifact
-                id: package
-                run: |
-                    cd ~/php-src
-                    PHP_VER="${{ matrix.php-version }}"
-                    OS_TAG="linux"
-                    ARCH_TAG="${{ matrix.arch.arch }}"
-                    TS_TAG="${{ matrix.ts }}"
-                    ASSET_NAME="php-php${PHP_VER}-${TS_TAG}-${OS_TAG}-${ARCH_TAG}"
-                    cp sapi/cli/php "${ASSET_NAME}"
-                    chmod +x "${ASSET_NAME}"
-                    echo "asset_name=${ASSET_NAME}" >> $GITHUB_OUTPUT
-                    echo "asset_path=${HOME}/php-src/${ASSET_NAME}" >> $GITHUB_OUTPUT
+                    for image in $GLIBC_DISTROS ubuntu:26.04; do
+                        echo "== ${image}"
+                        docker run --rm -v "$PWD/dist:/dist:ro" "$image" "/dist/$BINARY" -n -v
+                    done
 
             -   name: Upload artifact
                 uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
                 with:
-                    name: release--${{ steps.package.outputs.asset_name }}
-                    path: ${{ steps.package.outputs.asset_path }}
+                    name: release--${{ env.BINARY }}
+                    path: dist/
                     retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
-
-    # Lives in its own reusable workflow so pull requests that change it are
 
     # Builds the self-contained Windows PHP interpreter with php_debugger compiled in
     # statically, packaged as a zip in the same layout as the windows.php.net
@@ -806,7 +749,7 @@ jobs:
                     retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
     release:
-        needs: [build-macos, build-linux, build-windows, build-php-macos, build-php-linux, build-php-windows]
+        needs: [build-macos, build-linux, build-windows, build-php-unix, build-php-windows]
         if: github.event_name != 'pull_request'
         runs-on: ubuntu-latest
         permissions:
